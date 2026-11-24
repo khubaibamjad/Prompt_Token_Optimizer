@@ -24,6 +24,14 @@ def remove_filler(text):
         result = re.sub(re.escape(phrase), replacement, result, flags=re.IGNORECASE)
     return result
 
+def remove_repeated_words(text):
+    # "hello hello" → "hello",  "the the" → "the"
+    return re.sub(r"\b(\w+)(\s+\1\b)+", r"\1", text, flags=re.IGNORECASE)
+
+def remove_decorations(text):
+    # "---====" or "*****" → removed, but keeps "well-known" and "**bold**"
+    return re.sub(r"([-=_*#~])\1{2,}", " ", text)
+
 def collapse_whitespace(text):
     text = re.sub(r"[ \t]+", " ", text)     # many spaces/tabs → one space
     text = re.sub(r"\n{3,}", "\n\n", text)  # 3+ newlines → one blank line
@@ -53,8 +61,10 @@ def remove_duplicate_sentences(text):
 
 
 def optimize(text):
+    text = remove_repeated_words(text)
     text = remove_greeting(text)
     text = remove_filler(text)
+    text = remove_decorations(text)
     text = collapse_punctuation(text)
     text = collapse_whitespace(text)
     text = remove_duplicate_sentences(text)
