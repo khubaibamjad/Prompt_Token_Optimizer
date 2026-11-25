@@ -69,6 +69,11 @@ def rate(prompt, model="gpt-4o"):
     return overall, results
 
 
+def split_scores(results):
+    cost = round((results["efficiency"][0] + results["budget"][0]) / 2)
+    quality = round((results["structure"][0] + results["specificity"][0]) / 2)
+    return cost, quality
+
 def grade(score):
     for limit, letter in [(85, "A"), (70, "B"), (55, "C"), (40, "D")]:
         if score >= limit:
