@@ -1,10 +1,15 @@
 import re
+import json
 import time
+import hashlib
+from pathlib import Path
 import ollama
 from token_counter import count_tokens
+from optimizer import protect
 
 MODEL = "gemma3:4b"          # used to compress the prompt
-SPELL_MODEL = "gemma3:4b"    # used to fix spelling (can be a smaller model later)
+SPELL_MODEL = "gemma3:1b"    # smaller, faster model for the easy spelling task
+                             # (falls back to MODEL if it isn't downloaded: ollama pull gemma3:1b)
 
 # a client with a timeout, so the program can never hang forever
 client = ollama.Client(timeout=120)
@@ -70,24 +75,86 @@ def clean(text):
     return text
 
 
+# ---------- cache: the same prompt always gives the same answer (temperature 0) ----------
+CACHE_FILE = Path(__file__).with_name("llm_cache.json")
+try:
+    CACHE = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+except (FileNotFoundError, json.JSONDecodeError):
+    CACHE = {}
+
+def cache_key(model, system, prompt):
+    # the instructions are part of the key, so changing them never returns stale answers
+    return hashlib.sha256(f"{model}|{system}|{prompt}".encode("utf-8")).hexdigest()
+
+def save_cache():
+    CACHE_FILE.write_text(json.dumps(CACHE, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
 def ask(system, prompt, model):
-    """Send one prompt to the local model and return the cleaned reply."""
+    """Send one prompt to the local model and return (cleaned reply, seconds).
+    Uses the cache when the same prompt was asked before."""
+    key = cache_key(model, system, prompt)
+    if key in CACHE:
+        return CACHE[key], 0.0
+
     start = time.perf_counter()
-    response = client.chat(
-        model=model,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": f"Original: {prompt}\nOutput:"},
-        ],
-        options={
-            "temperature": 0,     # same input -> same output
-            "num_predict": 200,   # max tokens the model may write
-            "num_ctx": 2048,      # smaller context window = faster
-        },
-        keep_alive="30m",         # keep the model loaded for 30 minutes
-    )
+    try:
+        response = client.chat(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": f"Original: {prompt}\nOutput:"},
+            ],
+            options={
+                "temperature": 0,     # same input -> same output
+                "num_predict": 200,   # max tokens the model may write
+                "num_ctx": 2048,      # smaller context window = faster
+            },
+            keep_alive="30m",         # keep the model loaded for 30 minutes
+        )
+    except ollama.ResponseError as e:
+        # model not downloaded? use the main model instead
+        if e.status_code == 404 and model != MODEL:
+            print(f"  (model '{model}' not found, using '{MODEL}'. Run: ollama pull {model})")
+            reply, seconds = ask(system, prompt, MODEL)
+            CACHE[key] = reply          # remember it under the small model's name too
+            save_cache()
+            return reply, seconds
+        raise
     seconds = time.perf_counter() - start
-    return clean(response["message"]["content"]), seconds
+
+    reply = clean(response["message"]["content"])
+    CACHE[key] = reply
+    save_cache()
+    return reply, seconds
+
+
+# ---------- does the prompt even need a spell fix? ----------
+# texting short forms and real-but-usually-wrong words a dictionary can't catch
+SLANG = {"u", "r", "ur", "ya", "dat", "da", "dis", "plz", "pls", "thx", "luv", "hlp", "wat", "wht",
+         "wid", "coz", "cuz", "bcoz", "b4", "gr8", "n", "msg", "rite", "nd", "im", "dont", "cant", "wont"}
+TECH_WORDS = ["json", "api", "gpt", "llm", "ai", "tiktoken", "ollama", "python", "javascript", "sql",
+              "html", "css", "url", "regex", "github", "git", "chatgpt", "claude", "gemma", "app"]
+
+try:
+    from spellchecker import SpellChecker
+    SPELLER = SpellChecker()
+    SPELLER.word_frequency.load_words(TECH_WORDS)
+except ImportError:
+    SPELLER = None    # not installed: py -m pip install pyspellchecker
+
+
+def needs_spell_fix(text):
+    """True if the prompt has likely typos or texting slang. Skipping the spell
+    step for clean prompts saves one whole AI call."""
+    if SPELLER is None:
+        return True                                   # can't tell, so be safe
+    text, _ = protect(text)                           # ignore quoted text and code
+    words = re.findall(r"[A-Za-z][A-Za-z']*", text)
+    words = [w for w in words if w.islower()]         # skip names and acronyms (Ali, GPT)
+    if any(w in SLANG for w in words):
+        return True
+    return bool(SPELLER.unknown([w.strip("'") for w in words if len(w) > 1]))
 
 
 def spell_fix(prompt):

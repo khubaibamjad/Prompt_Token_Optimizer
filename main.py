@@ -1,6 +1,6 @@
 from token_counter import count_tokens, compare_models
 from optimizer import optimize, pre_clean, protected_parts, keyword_overlap
-from llm_optimizer import spell_fix, llm_optimize
+from llm_optimizer import spell_fix, llm_optimize, needs_spell_fix
 from scorer import rate, grade, split_scores
 
 USE_AI = True
@@ -46,13 +46,15 @@ def pipeline(prompt):
         show("0 pre-clean", text)
 
     # Step 1: fix spelling FIRST, because every rule depends on correct words
-    if USE_AI:
+    if USE_AI and not needs_spell_fix(text):
+        print("  [1 spell    ] skipped: no typos found")
+    elif USE_AI:
         try:
             fixed, secs = spell_fix(text)
             ok, why = spelling_is_safe(text, fixed)
             if ok:
                 text = fixed
-                show(f"1 spell {secs:.1f}s", text)
+                show("1 spell " + (f"{secs:.1f}s" if secs else "cache"), text)
             else:
                 print(f"  [1 spell    ] rejected: {why}")
         except Exception as e:
@@ -71,7 +73,7 @@ def pipeline(prompt):
             ok, why = compression_is_safe(rules_version, short)
             if ok:
                 final = short
-                show(f"3 AI {secs:.1f}s", final)
+                show("3 AI " + (f"{secs:.1f}s" if secs else "cache"), final)
             else:
                 print(f"  [3 AI       ] rejected: {why} -> {short[:100]}")
         except Exception as e:
