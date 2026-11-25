@@ -1,46 +1,47 @@
 import re
-import ollama
 import time
+import ollama
 from token_counter import count_tokens
-from optimizer import optimize
 
-MODEL = "gemma3:4b"
+MODEL = "gemma3:4b"          # used to compress the prompt
+SPELL_MODEL = "gemma3:4b"    # used to fix spelling (can be a smaller model later)
 
-SYSTEM = """You compress prompts so they use fewer tokens, without changing what is asked.
+# a client with a timeout, so the program can never hang forever
+client = ollama.Client(timeout=120)
 
-ALWAYS REMOVE:
-- Greetings and names at the start: hello, hi, hey, dear, salam, bhai, sir, bro, baby, yaar.
-- Please and its forms: please, plz, pls, kindly.
-- Thanks at the end: thank you, thanks, shukriya, thank you in advance.
-- Small talk: "I hope you are doing well", "how are you" (only when the prompt also asks for something else).
-- Filler: "I would like you to", "can you", "could you", "go ahead and", "basically", "actually",
-  "it is important to note that", "make sure that", "for me".
-- Repeated words, repeated sentences, extra punctuation like ??? or !!!, and decorations like ---- or ====.
 
-ALWAYS KEEP:
-- Every real question and request. Never drop one.
-- Names, numbers, limits and constraints (for example "500 words", "do not include code").
-- Text inside quotes or code exactly as written.
-- The same language as the original. Roman Urdu stays Roman Urdu. Never translate.
+# ---------- Step 1: spelling ----------
+SPELL_SYSTEM = """You fix spelling in prompts. Change NOTHING else.
+- Fix typos (doig -> doing, revrsal -> reversal, hlp -> help).
+- Fix the wrong word when context makes it clear (rite method -> write method).
+- Expand texting short forms (r -> are, u -> you, dat -> that, ur -> your, ary -> array).
+- Keep every word, greeting, question and punctuation mark otherwise. Do not shorten.
+- Roman Urdu words are not typos. Leave them as they are. Never translate.
+- Keep text inside quotes or code exactly as written.
+- Do NOT answer the prompt.
+- Put the corrected prompt between <prompt> and </prompt>. Write nothing else.
 
-ALSO:
-- Fix spelling mistakes (hlp -> help, luv -> love).
-- Use the shortest clear wording.
+Example:
+Original: hi how r u doig? can u hlp me rite a leter to my boss
+Output: <prompt>hi how are you doing? can you help me write a letter to my boss</prompt>"""
+
+
+# ---------- Step 3: compression ----------
+COMPRESS_SYSTEM = """You compress prompts so they use fewer tokens, without changing what is asked.
+- Keep every request and question. Never drop one.
+- Keep names, numbers, limits and constraints ("500 words", "no code").
+- Keep text inside quotes or code exactly as written.
+- Keep the same language. Roman Urdu stays Roman Urdu. Never translate.
+- Remove anything polite or chatty that is still left. Use the shortest clear wording.
 - Do NOT answer or carry out the prompt. Only rewrite it.
 - Put the rewritten prompt between <prompt> and </prompt>. Write nothing else.
 
 Examples:
-Original: Hello, can you please write me something like an email to my boss because I am sick and can't come tomorrow? Thank you!
-Output: <prompt>Write a short sick-leave email to my boss for tomorrow.</prompt>
+Original: Help me to write method for array reversal?
+Output: <prompt>Write a method to reverse an array.</prompt>
 
-Original: Hi babay how are you doing plz hlp me i luv u
-Output: <prompt>Help me. I love you.</prompt>
-
-Original: Hello bhai please mujhe ek email likh do manager ko ke main kal office nahi aa sakta, thank you so much
-Output: <prompt>Manager ko email likho ke main kal office nahi aa sakta.</prompt>"""
-
-# a client with a timeout, so the program can never hang forever
-client = ollama.Client(timeout=120)
+Original: I want you to write me an email to my boss because I will be absent tomorrow as I am sick.
+Output: <prompt>Write a sick-leave email to my boss for tomorrow.</prompt>"""
 
 
 def clean(text):
@@ -53,7 +54,7 @@ def clean(text):
         text = match.group(1).strip()
     else:
         # 2. fallback: remove a label like "**Rewritten prompt:**" at the start
-        text = re.sub(r"^\W*(here is|here's|optimized|rewritten|compressed|output)[^:\n]*:\W*", "", text, flags=re.I)
+        text = re.sub(r"^\W*(here is|here's|optimized|rewritten|compressed|corrected|output)[^:\n]*:\W*", "", text, flags=re.I)
         # and drop an explanation the model added after a blank line
         text = text.split("\n\n")[0].strip()
 
@@ -66,37 +67,37 @@ def clean(text):
     return text
 
 
-def llm_optimize(prompt):
-    start = time.perf_counter()                 # start the timer
-
+def ask(system, prompt, model):
+    """Send one prompt to the local model and return the cleaned reply."""
+    start = time.perf_counter()
     response = client.chat(
-        model=MODEL,
+        model=model,
         messages=[
-            {"role": "system", "content": SYSTEM},
+            {"role": "system", "content": system},
             {"role": "user", "content": f"Original: {prompt}\nOutput:"},
         ],
         options={
-            "temperature": 0,     # same input → same output
-            "num_predict": 150,   # max tokens the model may write
+            "temperature": 0,     # same input -> same output
+            "num_predict": 200,   # max tokens the model may write
             "num_ctx": 2048,      # smaller context window = faster
         },
         keep_alive="30m",         # keep the model loaded for 30 minutes
     )
+    seconds = time.perf_counter() - start
+    return clean(response["message"]["content"]), seconds
 
-    print(f"(AI took {time.perf_counter() - start:.1f}s)")
-    return clean(response["message"]["content"])
+
+def spell_fix(prompt):
+    return ask(SPELL_SYSTEM, prompt, SPELL_MODEL)
+
+
+def llm_optimize(prompt):
+    return ask(COMPRESS_SYSTEM, prompt, MODEL)
+
 
 if __name__ == "__main__":
     prompt = input("Paste your prompt: ")
-
-    step1 = optimize(prompt)          # free rules first
-    step2 = llm_optimize(step1)       # then the local model
-
-    # safety check: reject the model's version if it didn't save tokens
-    if count_tokens(step2) >= count_tokens(step1):
-        print("(model's rewrite wasn't shorter, keeping the rules version)")
-        step2 = step1
-
-    print(f"\nOriginal ({count_tokens(prompt):>3} tokens): {prompt}")
-    print(f"Rules    ({count_tokens(step1):>3} tokens): {step1}")
-    print(f"Model    ({count_tokens(step2):>3} tokens): {step2}")
+    fixed, t1 = spell_fix(prompt)
+    print(f"Spell fixed ({t1:.1f}s): {fixed}")
+    short, t2 = llm_optimize(fixed)
+    print(f"Compressed  ({t2:.1f}s): {short}")
