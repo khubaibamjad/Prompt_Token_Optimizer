@@ -21,7 +21,11 @@ FILLER = {
 def remove_filler(text):
     result = text
     for phrase, replacement in FILLER.items():
-        result = re.sub(re.escape(phrase), replacement, result, flags=re.IGNORECASE)
+        # \b = whole words only, so "please " can't match inside "pplease "
+        pattern = (r"\b" if phrase[0].isalnum() else "") + re.escape(phrase)
+        result = re.sub(pattern, replacement, result, flags=re.IGNORECASE)
+    # misspelled or short forms of "please": plz, pls, plzz, pleaseee, pplease
+    result = re.sub(r"\b(p+l+e*a*s+e*|pl[sz]+)\b\s*", "", result, flags=re.IGNORECASE)
     return result
 
 def remove_repeated_words(text):
@@ -44,10 +48,14 @@ def remove_greeting(text):
         r"(\s+(bhai|bro|sir|yaar|janab|there|team|all|everyone)\b[,!.]?)?\s*",
         "", text, flags=re.IGNORECASE)
 
+def remove_pleasantries(text):
+    # "I hope you are doing well today." adds tokens but nothing to the task
+    return re.sub(r"\bI hope (you are|you're|u r) doing (well|good|fine)( today)?[.!]?\s*", "", text, flags=re.IGNORECASE)
+
 def remove_closing_thanks(text):
     # removes "Thank you so much in advance for your help!" etc., but only at the END
     return re.sub(
-        r"[\s,.!]*\b(thank you|thanks|thx|shukriya|shukria)( so much| very much| a lot)?( in advance)?( for (your|the) help)?[.!]*\s*$",
+        r"[\s,]*\b(thank you|thanks|thx|shukriya|shukria)( so much| very much| a lot)?( in advance)?( for (your|the) help)?[.!]*\s*$",
         "", text, flags=re.IGNORECASE)
 
 def collapse_punctuation(text):
@@ -100,7 +108,9 @@ def keyword_overlap(original, rewritten):
     def keys(t):
         return {w[:5] for w in re.findall(r"[a-z]+", t.lower()) if len(w) > 3 and w not in STOPWORDS}
     orig = keys(original)
-    return len(orig & keys(rewritten)) / len(orig) if orig else 1.0
+    if len(orig) < 4:
+        return 1.0      # too few key words to judge (e.g. short, misspelled prompts)
+    return len(orig & keys(rewritten)) / len(orig)
 
 
 def optimize(text):
@@ -108,12 +118,13 @@ def optimize(text):
     text = remove_repeated_words(text)
     text = remove_greeting(text)
     text = remove_closing_thanks(text)
+    text = remove_pleasantries(text)
     text = remove_filler(text)
     text = remove_decorations(text)
     text = collapse_punctuation(text)
     text = collapse_whitespace(text)
     text = remove_duplicate_sentences(text)
-    text = text.strip()
+    text = text.strip().rstrip(",;").strip()
     text = text[:1].upper() + text[1:]      # capitalize the first letter
     return restore(text, saved)
 
