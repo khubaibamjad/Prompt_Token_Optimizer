@@ -1,5 +1,3 @@
-print("file started")
-
 import tiktoken
 
 MODELS = {
