@@ -1,5 +1,5 @@
 from token_counter import count_tokens, compare_models
-from optimizer import optimize, protected_parts, keyword_overlap
+from optimizer import optimize, pre_clean, protected_parts, keyword_overlap
 from llm_optimizer import spell_fix, llm_optimize
 from scorer import rate, grade, split_scores
 
@@ -40,12 +40,16 @@ def pipeline(prompt):
     print()
     show("original", prompt)
 
+    # Step 0: cheap cleanup (stretched letters, keyboard spam, symbol junk)
+    text = pre_clean(prompt)
+    if text != prompt:
+        show("0 pre-clean", text)
+
     # Step 1: fix spelling FIRST, because every rule depends on correct words
-    text = prompt
     if USE_AI:
         try:
-            fixed, secs = spell_fix(prompt)
-            ok, why = spelling_is_safe(prompt, fixed)
+            fixed, secs = spell_fix(text)
+            ok, why = spelling_is_safe(text, fixed)
             if ok:
                 text = fixed
                 show(f"1 spell {secs:.1f}s", text)

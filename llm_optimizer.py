@@ -16,14 +16,17 @@ SPELL_SYSTEM = """You fix spelling in prompts. Change NOTHING else.
 - Fix the wrong word when context makes it clear (rite method -> write method).
 - Expand texting short forms (r -> are, u -> you, dat -> that, ur -> your, ary -> array).
 - Keep every word, greeting, question and punctuation mark otherwise. Do not shorten.
-- Roman Urdu words are not typos. Leave them as they are. Never translate.
+- Roman Urdu: fix its typos too (leik do -> likh do, live -> liye, krta -> karta, app -> aap), but NEVER translate it to English.
 - Keep text inside quotes or code exactly as written.
 - Do NOT answer the prompt.
 - Put the corrected prompt between <prompt> and </prompt>. Write nothing else.
 
 Example:
 Original: hi how r u doig? can u hlp me rite a leter to my boss
-Output: <prompt>hi how are you doing? can you help me write a letter to my boss</prompt>"""
+Output: <prompt>hi how are you doing? can you help me write a letter to my boss</prompt>
+
+Original: bhai mere live aik msg leik do ke mein kal nai aa skta
+Output: <prompt>bhai mere liye aik msg likh do ke main kal nahi aa sakta</prompt>"""
 
 
 # ---------- Step 3: compression ----------
