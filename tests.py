@@ -104,6 +104,27 @@ AI_TESTS = [
 ]
 
 
+# (name, before, after, should it be flagged?)
+CONSTRAINT_TESTS = [
+    ("dropped 'no examples' is caught",
+     "Do not include any examples in your answer. Explain recursion, I don't want any code either.",
+     "Explain recursion in simple terms. No code.", True),
+    ("both negations kept is fine",
+     "Do not include any examples in your answer. Explain recursion, I don't want any code either.",
+     "Explain recursion. No examples, no code.", False),
+    ("dropped number is caught",
+     "Write a 500 word blog post about water.", "Write a blog post about water.", True),
+    ("negation flipped to positive is caught",
+     "Do not mention competitor brands.", "Mention competitor brands.", True),
+    ("spell step: fixed typo after negation is fine",
+     "i dont want any kode", "i don't want any code", False),
+    ("spell step: dropped negation is caught",
+     "i dont want any kode", "i want any code", True),
+    ("Roman Urdu negation kept",
+     "main kal office nahi aa sakta", "main kal office nahi aa sakta", False),
+]
+
+
 def check(result, must, must_not, exact):
     low = result.lower()                       # word checks ignore capitals
     problems = [f"missing {m!r}" for m in must if m.lower() not in low]
@@ -122,6 +143,14 @@ def run_rule_tests():
         if problems:
             failed += 1
             print(f"  ❌ {name}\n     got: {result!r}\n     " + "\n     ".join(problems))
+        else:
+            print(f"  ✅ {name}")
+    from optimizer import lost_constraints
+    for name, before, after, should_flag in CONSTRAINT_TESTS:
+        lost = lost_constraints(before, after, check_subjects=not name.startswith("spell step"))
+        if bool(lost) != should_flag:
+            failed += 1
+            print(f"  ❌ {name}\n     lost_constraints returned {lost}")
         else:
             print(f"  ✅ {name}")
     for name, prompt, must, must_not, exact in KNOWN_ISSUES:

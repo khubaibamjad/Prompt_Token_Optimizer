@@ -38,6 +38,7 @@ Output: <prompt>bhai mere liye aik msg likh do ke main kal nahi aa sakta</prompt
 COMPRESS_SYSTEM = """You compress prompts so they use fewer tokens, without changing what is asked.
 - Keep every request and question. Never drop one.
 - Keep names, numbers, limits and constraints ("500 words", "no code").
+- Keep EVERY "do not / don't / no / never / avoid" rule. If there are two, keep both.
 - Keep text inside quotes or code exactly as written.
 - Keep the same language. Roman Urdu stays Roman Urdu. Never translate.
 - Remove anything polite or chatty that is still left. Use the shortest clear wording.
@@ -47,6 +48,9 @@ COMPRESS_SYSTEM = """You compress prompts so they use fewer tokens, without chan
 Examples:
 Original: Help me to write method for array reversal?
 Output: <prompt>Write a method to reverse an array.</prompt>
+
+Original: Do not use any examples. Explain what an API is, and I don't want any code either.
+Output: <prompt>Explain what an API is. No examples, no code.</prompt>
 
 Original: I want you to write me an email to my boss because I will be absent tomorrow as I am sick.
 Output: <prompt>Write a sick-leave email to my boss for tomorrow.</prompt>"""

@@ -1,5 +1,5 @@
 from token_counter import count_tokens, compare_models
-from optimizer import optimize, pre_clean, protected_parts, keyword_overlap
+from optimizer import optimize, pre_clean, protected_parts, keyword_overlap, lost_constraints
 from llm_optimizer import spell_fix, llm_optimize, needs_spell_fix
 from scorer import rate, grade, split_scores
 
@@ -13,6 +13,9 @@ def spelling_is_safe(original, fixed):
     missing = [p for p in protected_parts(original) if p not in fixed]
     if missing:
         return False, f"changed protected text {missing}"
+    lost = lost_constraints(original, fixed, check_subjects=False)
+    if lost:
+        return False, f"lost rules or numbers: {lost}"
     ratio = count_tokens(fixed) / max(count_tokens(original), 1)
     if not 0.6 <= ratio <= 1.6:
         return False, f"length changed too much ({ratio:.1f}x), it probably rewrote or answered"
@@ -24,6 +27,9 @@ def compression_is_safe(before, after):
     missing = [p for p in protected_parts(before) if p not in after]
     if missing:
         return False, f"changed protected text {missing}"
+    lost = lost_constraints(before, after)
+    if lost:
+        return False, f"lost rules or numbers: {lost}"
     overlap = keyword_overlap(before, after)
     if overlap < 0.4:
         return False, f"kept only {overlap:.0%} of the key words, it probably answered instead of rewriting"

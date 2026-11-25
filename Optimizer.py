@@ -138,6 +138,44 @@ STOPWORDS = {"the", "and", "that", "this", "with", "for", "from", "your", "what"
              "want", "like", "something", "because", "feeling", "come", "just", "please",
              "very", "really", "some", "also", "make", "sure", "thank", "thanks", "tell"}
 
+NEGATIONS = r"(do not|don't|dont|does not|doesn't|must not|mustn't|should not|shouldn't|never|no|not|avoid|without|nahi|mat)"
+# generic verbs after a negation; the real rule is in the noun that follows ("do not include EXAMPLES")
+GENERIC_VERBS = {"include", "want", "need", "give", "mention", "write", "make", "add", "show",
+                 "provide", "type", "put", "send", "share"}
+
+def lost_constraints(before, after, check_subjects=True):
+    """Rules and limits that disappeared between two versions of a prompt:
+    every number must survive, and every negative rule ("do not include examples")
+    must keep its subject AND some negation word."""
+    lost = []
+    low_after = after.lower()
+
+    # 1. numbers: "500 words", "$899", "16GB"
+    for num in re.findall(r"\d+(?:[.,]\d+)?", before):
+        if num not in after:
+            lost.append(num)
+
+    # 2. negative rules
+    if not check_subjects:
+        # spell step: words may legitimately change (kode -> code), so only check
+        # that no negation disappeared
+        n_before = len(re.findall(rf"\b{NEGATIONS}\b", before.lower()))
+        n_after = len(re.findall(rf"\b{NEGATIONS}\b", low_after))
+        if n_after < n_before:
+            lost.append(f"{n_before - n_after} negation(s)")
+        return lost
+    has_negation_after = re.search(rf"\b{NEGATIONS}\b", low_after) is not None
+    for m in re.finditer(rf"\b{NEGATIONS}\b((?:\s+[\w']+){{1,4}})", before.lower()):
+        words = [w for w in re.findall(r"[a-z]+", m.group(2))
+                 if len(w) > 3 and w not in STOPWORDS and w not in GENERIC_VERBS]
+        if not words:
+            continue
+        kept = any(w[:5] in low_after for w in words)
+        if not (kept and has_negation_after):
+            lost.append(f"{m.group(1)}{m.group(2)}".strip())
+    return lost
+
+
 def keyword_overlap(original, rewritten):
     """Share of the original's key words still in the rewrite (0.0 to 1.0).
     Words are compared by their first 5 letters, so 'lyrics' matches 'lyrical'."""
