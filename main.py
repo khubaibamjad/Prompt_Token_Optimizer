@@ -8,9 +8,9 @@ USE_AI = True
 def pipeline(prompt):
     rules_version=optimize(prompt)
     final=rules_version
-    if USE_AI:
+    if USE_AI and count_tokens(rules_version) > 15:
         try:
-            ai_version = llm_optimize(rules_version)
+            ai_version = optimize(llm_optimize(rules_version))   # clean the AI output with the rules too
             if count_tokens(ai_version)<count_tokens(rules_version):
                 final=ai_version
             else:
@@ -45,7 +45,15 @@ def report(prompt, final):
 
 
 if __name__ == "__main__":
-    prompt = input("Paste your prompt: ").strip()
+    print("Paste your prompt, then press Enter on an empty line:")
+    lines = []
+    while True:
+        line = input()
+        if line == "":
+            break
+        lines.append(line)
+    prompt = "\n".join(lines).strip()
+
     if not prompt:
         print("Empty prompt.")
         exit()
