@@ -14,7 +14,7 @@ FILLER = {
     "it is important to note that ": "",
     "basically ": "",
     "actually ": "",
-    " for me ": "",
+    " for me": "",
 }
 
 
@@ -44,6 +44,7 @@ def remove_greeting(text):
 def collapse_punctuation(text):
     text = re.sub(r"([?!.])\1+", r"\1", text)   # ?? → ?   !!! → !
     text = re.sub(r"\s+([?!.,])", r"\1", text)  # "it ?" → "it?"
+    text = re.sub(r"([?!])[.?!]+", r"\1", text)  # "?." → "?"
     return text
 
 def remove_duplicate_sentences(text):
