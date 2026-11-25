@@ -11,6 +11,7 @@ Rules:
 - Keep EVERY question and request from the original. Never drop one.
 - Keep the exact same meaning, names, numbers and constraints.
 - Keep text inside quotes exactly as written.
+- Keep the SAME language as the original (Roman Urdu stays Roman Urdu). Never translate.
 - Fix spelling mistakes.
 - Remove greetings, filler, politeness and repetition. Use shorter wording.
 - Do NOT answer or carry out the prompt. Only rewrite it.
