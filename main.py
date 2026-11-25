@@ -19,3 +19,9 @@ def pipeline(prompt):
             print(f"(AI step skipped: {e})")   # e.g. Ollama isn't running
     return rules_version, final
 
+def report(prompt, final):
+    before_score, _ = rate(prompt)
+    after_score, details = rate(final)
+    before_tokens = count_tokens(prompt)
+    after_tokens = count_tokens(final)
+    saved = before_tokens - after_tokens
