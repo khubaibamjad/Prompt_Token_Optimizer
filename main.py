@@ -8,7 +8,7 @@ USE_AI = True
 def pipeline(prompt):
     rules_version=optimize(prompt)
     final=rules_version
-    if USE_AI and count_tokens(rules_version) > 15:
+    if USE_AI and count_tokens(rules_version) > 8:
         try:
             ai_version = optimize(llm_optimize(rules_version))   # clean the AI output with the rules too
             print(f"(AI suggested, {count_tokens(ai_version)} tokens: {ai_version[:200]})")
