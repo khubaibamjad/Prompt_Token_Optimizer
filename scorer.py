@@ -1,4 +1,5 @@
 import re
+import sys
 from token_counter import count_tokens
 from optimizer import optimize
 
@@ -18,9 +19,12 @@ VAGUE_WORDS = ["something", "stuff", "things", "etc", "good", "nice", "whatever"
 def score_efficiency(prompt, model):
     """How much of the prompt is waste the optimizer can remove?"""
     before = count_tokens(prompt, model)
+    if before == 0:
+        return 100, "empty prompt"
     after = count_tokens(optimize(prompt), model)
-    waste = (before - after) / before
-    return round(100 * (1 - waste)), f"{before - after} of {before} tokens are removable filler"
+    waste = max(before - after, 0) / before
+    # on an already optimized prompt this measures what's left, so it's near 100
+    return round(100 * (1 - waste)), f"{before - after} of {before} tokens are remaining filler"
 
 
 def score_structure(prompt):
@@ -45,7 +49,7 @@ def score_specificity(prompt):
 def score_budget(prompt, model):
     """Is the prompt a sensible size for the model's context window?"""
     tokens = count_tokens(prompt, model)
-    used = tokens / CONTEXT_WINDOWS[model]
+    used = tokens / CONTEXT_WINDOWS.get(model, 128000)
     if tokens < 8:
         return 40, f"only {tokens} tokens, likely too little context"
     if used > 0.5:
@@ -85,7 +89,7 @@ if __name__ == "__main__":
     prompt = input("Paste your prompt: ")
     if not prompt.strip():
         print("Empty prompt.")
-        exit()
+        sys.exit()
 
     overall, results = rate(prompt)
     print(f"\nOverall score: {overall}/100  (grade {grade(overall)})\n")

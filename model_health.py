@@ -62,7 +62,9 @@ def check_model(name):
 
 # ---------- 3. speed test ----------
 def benchmark(name):
-    results = []
+    """Run the spell task RUNS times. Returns (best seconds, average seconds, average write speed),
+    or None if there were no runs."""
+    walls, speeds, reply = [], [], ""
     for i in range(RUNS):
         start = time.perf_counter()
         r = client.chat(
@@ -77,13 +79,18 @@ def benchmark(name):
         load = get(r, "load_duration", 0) / ns
         p_tok, p_time = get(r, "prompt_eval_count", 0), get(r, "prompt_eval_duration", 0) / ns
         e_tok, e_time = get(r, "eval_count", 0), get(r, "eval_duration", 0) / ns
-        results.append(wall)
+        speed = e_tok / e_time if e_time else 0
+        walls.append(wall)
+        speeds.append(speed)
+        reply = r["message"]["content"].strip().replace("\n", " ")
         print(f"   run {i + 1}: {wall:5.1f}s total | load {load:4.1f}s | "
               f"read {p_tok} tok @ {p_tok / p_time if p_time else 0:5.1f} tok/s | "
-              f"write {e_tok} tok @ {e_tok / e_time if e_time else 0:5.1f} tok/s")
-    reply = r["message"]["content"].strip().replace("\n", " ")
+              f"write {e_tok} tok @ {speed:5.1f} tok/s")
+    if not walls:
+        print("   no runs (RUNS = 0)")
+        return None
     print(f"   output: {reply[:120]}")
-    return min(results), e_tok / e_time if e_time else 0
+    return min(walls), sum(walls) / len(walls), sum(speeds) / len(speeds)
 
 
 # ---------- 4. what's loaded, and on CPU or GPU? ----------
@@ -120,14 +127,16 @@ if __name__ == "__main__":
             continue
         try:
             check_model(name)
-            best, speed = benchmark(name)
-            summary.append((name, best, speed))
+            result = benchmark(name)
+            if result:
+                summary.append((name, *result))
         except ollama.ResponseError as e:
             print(f"   ❌ error: {e}")
 
     check_loaded()
 
     if summary:
-        print("\n5. Summary (best of", RUNS, "runs)")
-        for name, best, speed in summary:
-            print(f"   {name:<20} {best:5.1f}s per spell fix | writes {speed:5.1f} tok/s  {verdict(speed)}")
+        print(f"\n5. Summary ({RUNS} runs each)")
+        for name, best, avg, speed in summary:
+            print(f"   {name:<20} best {best:5.1f}s, average {avg:5.1f}s per spell fix | "
+                  f"writes {speed:5.1f} tok/s on average  {verdict(speed)}")

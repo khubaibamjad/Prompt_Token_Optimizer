@@ -14,6 +14,13 @@ SPELL_MODEL = "gemma3:1b"    # smaller, faster model for the easy spelling task
 # a client with a timeout, so the program can never hang forever
 client = ollama.Client(timeout=120)
 
+# prompts longer than this skip the AI steps instead of being cut short
+MAX_AI_TOKENS = 1500
+
+
+class OutputCutOff(Exception):
+    """The model stopped before finishing its answer (output limit reached)."""
+
 
 # ---------- Step 1: spelling ----------
 SPELL_SYSTEM = """You fix spelling in prompts. Change NOTHING else.
@@ -65,10 +72,13 @@ def clean(text):
     if match:
         text = match.group(1).strip()
     else:
-        # 2. fallback: remove a label like "**Rewritten prompt:**" at the start
-        text = re.sub(r"^\W*(here is|here's|optimized|rewritten|compressed|corrected|output)[^:\n]*:\W*", "", text, flags=re.I)
-        # and drop an explanation the model added after a blank line
-        text = text.split("\n\n")[0].strip()
+        # 2. fallback: remove a chatty opener that ends in ":" at the start, like
+        #    "Sure! Here is the optimized prompt:" or "**Rewritten prompt:**". Keep all paragraphs.
+        text = re.sub(
+            r"^[\s*#]*(?:(?:sure|okay|ok|certainly|of course|absolutely)\b[!.,]?\s*)?"
+            r"(?:here(?:'s| is| are)\b[^:\n]{0,60}|(?:the\s+)?(?:optimi[sz]ed|rewritten|compressed|corrected|shortened|fixed)"
+            r"(?:\s+(?:prompt|version|text))?|output)\s*:[\s*]*",
+            "", text, flags=re.I)
 
     # 3. curly quotes -> straight quotes, so protected text still matches
     text = text.replace("“", '"').replace("”", '"').replace("‘", "'").replace("’", "'")
@@ -94,9 +104,36 @@ def save_cache():
     CACHE_FILE.write_text(json.dumps(CACHE, ensure_ascii=False, indent=1), encoding="utf-8")
 
 
+def remember(system, model, prompt, reply):
+    """Cache an answer. Called only after it passed the safety checks."""
+    CACHE[cache_key(model, system, prompt)] = reply
+    save_cache()
+
+def forget(system, model, prompt):
+    """Drop a cached answer that failed the safety checks, so it's retried next time."""
+    if CACHE.pop(cache_key(model, system, prompt), None) is not None:
+        save_cache()
+
+
+def generation_options(system, prompt):
+    """Output and context limits sized to the prompt, so nothing gets cut off."""
+    num_predict = count_tokens(prompt) * 2 + 50
+    needed = count_tokens(system) + count_tokens(prompt) + num_predict + 100
+    num_ctx = max(2048, -(-needed // 1024) * 1024)          # round up to a multiple of 1024
+    return {"temperature": 0, "num_predict": num_predict, "num_ctx": num_ctx}
+
+
+def _field(response, key):
+    value = getattr(response, key, None)
+    if value is None and isinstance(response, dict):
+        value = response.get(key)
+    return value
+
+
 def ask(system, prompt, model):
     """Send one prompt to the local model and return (cleaned reply, seconds).
-    Uses the cache when the same prompt was asked before."""
+    Uses the cache when the same prompt was accepted before (seconds = 0).
+    Raises OutputCutOff if the model ran out of room before finishing."""
     key = cache_key(model, system, prompt)
     if key in CACHE:
         return CACHE[key], 0.0
@@ -109,28 +146,22 @@ def ask(system, prompt, model):
                 {"role": "system", "content": system},
                 {"role": "user", "content": f"Original: {prompt}\nOutput:"},
             ],
-            options={
-                "temperature": 0,     # same input -> same output
-                "num_predict": 200,   # max tokens the model may write
-                "num_ctx": 2048,      # smaller context window = faster
-            },
+            options=generation_options(system, prompt),   # temperature 0, sized limits
             keep_alive="30m",         # keep the model loaded for 30 minutes
         )
     except ollama.ResponseError as e:
         # model not downloaded? use the main model instead
         if e.status_code == 404 and model != MODEL:
             print(f"  (model '{model}' not found, using '{MODEL}'. Run: ollama pull {model})")
-            reply, seconds = ask(system, prompt, MODEL)
-            CACHE[key] = reply          # remember it under the small model's name too
-            save_cache()
-            return reply, seconds
+            return ask(system, prompt, MODEL)
         raise
     seconds = time.perf_counter() - start
 
-    reply = clean(response["message"]["content"])
-    CACHE[key] = reply
-    save_cache()
-    return reply, seconds
+    raw = response["message"]["content"]
+    if _field(response, "done_reason") == "length" or (
+            re.search(r"<prompt>", raw, re.I) and not re.search(r"</prompt>", raw, re.I)):
+        raise OutputCutOff("the model's output was cut off before it finished")
+    return clean(raw), seconds
 
 
 # ---------- does the prompt even need a spell fix? ----------
@@ -154,7 +185,13 @@ def needs_spell_fix(text):
     if SPELLER is None:
         return True                                   # can't tell, so be safe
     text, _ = protect(text)                           # ignore quoted text and code
-    words = re.findall(r"[A-Za-z][A-Za-z']*", text)
+    words = []
+    for m in re.finditer(r"[A-Za-z][A-Za-z']*", text):
+        w = m.group(0)
+        # a capital at the start of a sentence isn't a name: "Halp me" -> "halp"
+        if w[0].isupper() and w[1:].islower() and re.search(r"(^|[.!?])\s*$", text[:m.start()]):
+            w = w.lower()
+        words.append(w)
     words = [w for w in words if w.islower()]         # skip names and acronyms (Ali, GPT)
     if any(w in SLANG for w in words):
         return True
@@ -164,9 +201,21 @@ def needs_spell_fix(text):
 def spell_fix(prompt):
     return ask(SPELL_SYSTEM, prompt, SPELL_MODEL)
 
+def remember_spell(prompt, reply):
+    remember(SPELL_SYSTEM, SPELL_MODEL, prompt, reply)
+
+def forget_spell(prompt):
+    forget(SPELL_SYSTEM, SPELL_MODEL, prompt)
+
 
 def llm_optimize(prompt):
     return ask(COMPRESS_SYSTEM, prompt, MODEL)
+
+def remember_compression(prompt, reply):
+    remember(COMPRESS_SYSTEM, MODEL, prompt, reply)
+
+def forget_compression(prompt):
+    forget(COMPRESS_SYSTEM, MODEL, prompt)
 
 
 if __name__ == "__main__":

@@ -1,3 +1,4 @@
+import sys
 import tiktoken
 
 MODELS = {
@@ -6,14 +7,31 @@ MODELS = {
 }
 
 
+DEFAULT_ENCODING = "o200k_base"
+_ENCODERS = {}          # loaded once, reused on every call
+_WARNED = set()
+
+
+def get_encoder(model="gpt-4o"):
+    """The tokenizer for a model. Unknown models fall back to o200k_base with a warning."""
+    name = MODELS.get(model)
+    if name is None:
+        if model not in _WARNED:
+            print(f"(unknown model '{model}', counting tokens with {DEFAULT_ENCODING})", file=sys.stderr)
+            _WARNED.add(model)
+        name = DEFAULT_ENCODING
+    if name not in _ENCODERS:
+        _ENCODERS[name] = tiktoken.get_encoding(name)
+    return _ENCODERS[name]
+
+
 def count_tokens(text, model="gpt-4o"):
     """Return the number of tokens."""
-    enc = tiktoken.get_encoding(MODELS[model])
-    return len(enc.encode(text))
+    return len(get_encoder(model).encode(text))
 
 def show_tokens(text, model="gpt-4o"):
     """Print each token wrapped in [brackets]."""
-    enc = tiktoken.get_encoding(MODELS[model])
+    enc = get_encoder(model)
     ids = enc.encode(text)
     pieces = [enc.decode([i]) for i in ids]
     print("Tokens:", "".join(f"[{p}]" for p in pieces))

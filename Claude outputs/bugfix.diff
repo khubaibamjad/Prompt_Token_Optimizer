@@ -1,0 +1,1318 @@
+--- base/llm_optimizer.py	2026-11-26 00:14:37.812879445 +0500
++++ w/llm_optimizer.py	2026-11-26 00:23:53.137364001 +0500
+@@ -14,6 +14,13 @@
+ # a client with a timeout, so the program can never hang forever
+ client = ollama.Client(timeout=120)
+ 
++# prompts longer than this skip the AI steps instead of being cut short
++MAX_AI_TOKENS = 1500
++
++
++class OutputCutOff(Exception):
++    """The model stopped before finishing its answer (output limit reached)."""
++
+ 
+ # ---------- Step 1: spelling ----------
+ SPELL_SYSTEM = """You fix spelling in prompts. Change NOTHING else.
+@@ -65,10 +72,13 @@
+     if match:
+         text = match.group(1).strip()
+     else:
+-        # 2. fallback: remove a label like "**Rewritten prompt:**" at the start
+-        text = re.sub(r"^\W*(here is|here's|optimized|rewritten|compressed|corrected|output)[^:\n]*:\W*", "", text, flags=re.I)
+-        # and drop an explanation the model added after a blank line
+-        text = text.split("\n\n")[0].strip()
++        # 2. fallback: remove a chatty opener that ends in ":" at the start, like
++        #    "Sure! Here is the optimized prompt:" or "**Rewritten prompt:**". Keep all paragraphs.
++        text = re.sub(
++            r"^[\s*#]*(?:(?:sure|okay|ok|certainly|of course|absolutely)\b[!.,]?\s*)?"
++            r"(?:here(?:'s| is| are)\b[^:\n]{0,60}|(?:the\s+)?(?:optimi[sz]ed|rewritten|compressed|corrected|shortened|fixed)"
++            r"(?:\s+(?:prompt|version|text))?|output)\s*:[\s*]*",
++            "", text, flags=re.I)
+ 
+     # 3. curly quotes -> straight quotes, so protected text still matches
+     text = text.replace("“", '"').replace("”", '"').replace("‘", "'").replace("’", "'")
+@@ -94,9 +104,36 @@
+     CACHE_FILE.write_text(json.dumps(CACHE, ensure_ascii=False, indent=1), encoding="utf-8")
+ 
+ 
++def remember(system, model, prompt, reply):
++    """Cache an answer. Called only after it passed the safety checks."""
++    CACHE[cache_key(model, system, prompt)] = reply
++    save_cache()
++
++def forget(system, model, prompt):
++    """Drop a cached answer that failed the safety checks, so it's retried next time."""
++    if CACHE.pop(cache_key(model, system, prompt), None) is not None:
++        save_cache()
++
++
++def generation_options(system, prompt):
++    """Output and context limits sized to the prompt, so nothing gets cut off."""
++    num_predict = count_tokens(prompt) * 2 + 50
++    needed = count_tokens(system) + count_tokens(prompt) + num_predict + 100
++    num_ctx = max(2048, -(-needed // 1024) * 1024)          # round up to a multiple of 1024
++    return {"temperature": 0, "num_predict": num_predict, "num_ctx": num_ctx}
++
++
++def _field(response, key):
++    value = getattr(response, key, None)
++    if value is None and isinstance(response, dict):
++        value = response.get(key)
++    return value
++
++
+ def ask(system, prompt, model):
+     """Send one prompt to the local model and return (cleaned reply, seconds).
+-    Uses the cache when the same prompt was asked before."""
++    Uses the cache when the same prompt was accepted before (seconds = 0).
++    Raises OutputCutOff if the model ran out of room before finishing."""
+     key = cache_key(model, system, prompt)
+     if key in CACHE:
+         return CACHE[key], 0.0
+@@ -109,28 +146,22 @@
+                 {"role": "system", "content": system},
+                 {"role": "user", "content": f"Original: {prompt}\nOutput:"},
+             ],
+-            options={
+-                "temperature": 0,     # same input -> same output
+-                "num_predict": 200,   # max tokens the model may write
+-                "num_ctx": 2048,      # smaller context window = faster
+-            },
++            options=generation_options(system, prompt),   # temperature 0, sized limits
+             keep_alive="30m",         # keep the model loaded for 30 minutes
+         )
+     except ollama.ResponseError as e:
+         # model not downloaded? use the main model instead
+         if e.status_code == 404 and model != MODEL:
+             print(f"  (model '{model}' not found, using '{MODEL}'. Run: ollama pull {model})")
+-            reply, seconds = ask(system, prompt, MODEL)
+-            CACHE[key] = reply          # remember it under the small model's name too
+-            save_cache()
+-            return reply, seconds
++            return ask(system, prompt, MODEL)
+         raise
+     seconds = time.perf_counter() - start
+ 
+-    reply = clean(response["message"]["content"])
+-    CACHE[key] = reply
+-    save_cache()
+-    return reply, seconds
++    raw = response["message"]["content"]
++    if _field(response, "done_reason") == "length" or (
++            re.search(r"<prompt>", raw, re.I) and not re.search(r"</prompt>", raw, re.I)):
++        raise OutputCutOff("the model's output was cut off before it finished")
++    return clean(raw), seconds
+ 
+ 
+ # ---------- does the prompt even need a spell fix? ----------
+@@ -154,7 +185,13 @@
+     if SPELLER is None:
+         return True                                   # can't tell, so be safe
+     text, _ = protect(text)                           # ignore quoted text and code
+-    words = re.findall(r"[A-Za-z][A-Za-z']*", text)
++    words = []
++    for m in re.finditer(r"[A-Za-z][A-Za-z']*", text):
++        w = m.group(0)
++        # a capital at the start of a sentence isn't a name: "Halp me" -> "halp"
++        if w[0].isupper() and w[1:].islower() and re.search(r"(^|[.!?])\s*$", text[:m.start()]):
++            w = w.lower()
++        words.append(w)
+     words = [w for w in words if w.islower()]         # skip names and acronyms (Ali, GPT)
+     if any(w in SLANG for w in words):
+         return True
+@@ -164,10 +201,22 @@
+ def spell_fix(prompt):
+     return ask(SPELL_SYSTEM, prompt, SPELL_MODEL)
+ 
++def remember_spell(prompt, reply):
++    remember(SPELL_SYSTEM, SPELL_MODEL, prompt, reply)
++
++def forget_spell(prompt):
++    forget(SPELL_SYSTEM, SPELL_MODEL, prompt)
++
+ 
+ def llm_optimize(prompt):
+     return ask(COMPRESS_SYSTEM, prompt, MODEL)
+ 
++def remember_compression(prompt, reply):
++    remember(COMPRESS_SYSTEM, MODEL, prompt, reply)
++
++def forget_compression(prompt):
++    forget(COMPRESS_SYSTEM, MODEL, prompt)
++
+ 
+ if __name__ == "__main__":
+     prompt = input("Paste your prompt: ")
+--- base/main.py	2026-11-26 00:14:37.812901727 +0500
++++ w/main.py	2026-11-26 00:23:53.155452825 +0500
+@@ -1,38 +1,89 @@
++import re
++import sys
+ from token_counter import count_tokens, compare_models
+-from optimizer import optimize, pre_clean, protected_parts, keyword_overlap, lost_constraints
+-from llm_optimizer import spell_fix, llm_optimize, needs_spell_fix
++from optimizer import (optimize, pre_clean, protected_parts, keyword_overlap, lost_constraints,
++                       lost_requests, normalize_quotes, script_of)
++from llm_optimizer import (spell_fix, llm_optimize, needs_spell_fix, MAX_AI_TOKENS,
++                           remember_spell, forget_spell, remember_compression, forget_compression)
+ from scorer import rate, grade, split_scores
+ 
+ USE_AI = True
+ 
++# common Roman Urdu words; if the input has them and the output doesn't, it was translated
++ROMAN_URDU = {"hai", "ho", "mujhe", "karo", "likh", "likho", "nahi", "bhai", "ka", "ki", "ke",
++              "mein", "main", "kya", "aap", "apne", "mera", "meri", "kar", "do", "se", "ko"}
++
++
++def missing_protected(before, after):
++    """Quoted text and code from `before` that isn't in `after` (curly and straight quotes count as the same)."""
++    after_n = normalize_quotes(after)
++    return [p for p in protected_parts(before) if normalize_quotes(p) not in after_n]
++
++
++def restore_quote_style(original, text):
++    """Put the user's own curly quotes back after the AI straightened them."""
++    for part in protected_parts(original):
++        plain = normalize_quotes(part)
++        if plain != part and part not in text:
++            text = text.replace(plain, part, 1)
++    return text
++
++
++def changed_language(before, after):
++    """Why the output is in a different language or script than the input, or ''."""
++    s_before, s_after = script_of(before), script_of(after)
++    if "none" not in (s_before, s_after) and s_before != s_after:
++        return f"script changed from {s_before} to {s_after}"
++    words_before = re.findall(r"[a-z]+", before.lower())
++    urdu_before = sum(w in ROMAN_URDU for w in words_before)
++    if urdu_before >= 3:
++        urdu_after = sum(w in ROMAN_URDU for w in re.findall(r"[a-z]+", after.lower()))
++        if urdu_after < urdu_before / 2:
++            return "Roman Urdu was translated or dropped"
++    return ""
++
+ 
+ def spelling_is_safe(original, fixed):
+-    """A spell fix must keep quoted text and stay about the same length."""
++    """A spell fix must keep quoted text, numbers and negations, the same language,
++    and stay about the same length."""
+     if not fixed:
+         return False, "empty result"
+-    missing = [p for p in protected_parts(original) if p not in fixed]
++    missing = missing_protected(original, fixed)
+     if missing:
+         return False, f"changed protected text {missing}"
+     lost = lost_constraints(original, fixed, check_subjects=False)
+     if lost:
+         return False, f"lost rules or numbers: {lost}"
+-    ratio = count_tokens(fixed) / max(count_tokens(original), 1)
+-    if not 0.6 <= ratio <= 1.6:
+-        return False, f"length changed too much ({ratio:.1f}x), it probably rewrote or answered"
++    why = changed_language(original, fixed)
++    if why:
++        return False, why
++    before, after = count_tokens(original), count_tokens(fixed)
++    ratio = after / max(before, 1)
++    if not (0.85 <= ratio <= 1.3 or abs(after - before) <= 3):   # small prompts may shift a few tokens
++        return False, f"length changed too much ({ratio:.2f}x), it probably rewrote, cut or answered"
+     return True, ""
+ 
+ 
+ def compression_is_safe(before, after):
+-    """A compressed prompt must keep quoted text, key words, and be shorter."""
+-    missing = [p for p in protected_parts(before) if p not in after]
++    """A compressed prompt must keep quoted text, rules, numbers, every request,
++    the same language, most key words, and be shorter."""
++    if not after.strip():
++        return False, "empty result"
++    missing = missing_protected(before, after)
+     if missing:
+         return False, f"changed protected text {missing}"
+     lost = lost_constraints(before, after)
+     if lost:
+         return False, f"lost rules or numbers: {lost}"
++    dropped = lost_requests(before, after)
++    if dropped:
++        return False, f"dropped requests: {dropped}"
++    why = changed_language(before, after)
++    if why:
++        return False, why
+     overlap = keyword_overlap(before, after)
+-    if overlap < 0.4:
+-        return False, f"kept only {overlap:.0%} of the key words, it probably answered instead of rewriting"
++    if overlap < 0.7:
++        return False, f"kept only {overlap:.0%} of the key words, it probably changed the meaning"
+     if count_tokens(after) >= count_tokens(before):
+         return False, "not shorter"
+     return True, ""
+@@ -51,58 +102,70 @@
+     if text != prompt:
+         show("0 pre-clean", text)
+ 
++    use_ai = USE_AI
++    if use_ai and count_tokens(text) > MAX_AI_TOKENS:
++        print(f"  [AI         ] skipped: prompt is over {MAX_AI_TOKENS} tokens, the model could cut it short")
++        use_ai = False
++
+     # Step 1: fix spelling FIRST, because every rule depends on correct words
+-    if USE_AI and not needs_spell_fix(text):
++    if use_ai and not needs_spell_fix(text):
+         print("  [1 spell    ] skipped: no typos found")
+-    elif USE_AI:
++    elif use_ai:
+         try:
+             fixed, secs = spell_fix(text)
+             ok, why = spelling_is_safe(text, fixed)
+             if ok:
+-                text = fixed
++                remember_spell(text, fixed)          # only accepted answers are cached
++                text = restore_quote_style(text, fixed)
+                 show("1 spell " + (f"{secs:.1f}s" if secs else "cache"), text)
+             else:
++                forget_spell(text)                   # a bad cached answer gets retried next time
+                 print(f"  [1 spell    ] rejected: {why}")
+         except Exception as e:
+-            print(f"  [1 spell    ] skipped: {e}")   # e.g. Ollama isn't running
++            print(f"  [1 spell    ] skipped: {e}")   # e.g. Ollama isn't running, or output cut off
+ 
+     # Step 2: rules (greetings, please, thanks, small talk, filler, duplicates, symbols)
+     rules_version = optimize(text)
++    if not rules_version.strip():
++        print("  [2 rules    ] removed everything (greeting or politeness only), keeping the original prompt")
++        return prompt, prompt
+     show("2 rules", rules_version)
+ 
+     # Step 3: AI compression, only worth it for longer prompts
+     final = rules_version
+-    if USE_AI and count_tokens(rules_version) > 8:
++    if use_ai and count_tokens(rules_version) > 8:
+         try:
+-            short, secs = llm_optimize(rules_version)
+-            short = optimize(short)              # clean the AI output with the rules too
++            raw, secs = llm_optimize(rules_version)
++            short = optimize(raw)                    # clean the AI output with the rules too
+             ok, why = compression_is_safe(rules_version, short)
+             if ok:
+-                final = short
++                remember_compression(rules_version, raw)
++                final = restore_quote_style(rules_version, short)
+                 show("3 AI " + (f"{secs:.1f}s" if secs else "cache"), final)
+             else:
++                forget_compression(rules_version)
+                 print(f"  [3 AI       ] rejected: {why} -> {short[:100]}")
+         except Exception as e:
+             print(f"  [3 AI       ] skipped: {e}")
+     return rules_version, final
+ 
+ def report(prompt, final):
+-    before_score, before_details = rate(prompt)          # ← changed: keep before_details
++    before_score, before_details = rate(prompt)
+     after_score, details = rate(final)
+     before_tokens = count_tokens(prompt)
+     after_tokens = count_tokens(final)
+     saved = before_tokens - after_tokens
+ 
+-    b_cost, b_quality = split_scores(before_details)      # ← new
+-    a_cost, a_quality = split_scores(details)             # ← new
++    b_cost, b_quality = split_scores(before_details)
++    a_cost, a_quality = split_scores(details)
+ 
+     print("\n" + "=" * 50)
+     print("ORIGINAL :", prompt)
+     print("OPTIMIZED:", final)
+     print("=" * 50)
+-    print(f"Tokens        : {before_tokens} → {after_tokens}  (saved {saved}, {saved / before_tokens:.0%})")
+-    print(f"Cost score    : {b_cost} → {a_cost}   (how token-efficient)")        # ← new
+-    print(f"Quality score : {b_quality} → {a_quality}   (how clear and complete)")  # ← new
++    print(f"Tokens        : {before_tokens} → {after_tokens}  (saved {saved}, {saved / max(before_tokens, 1):.0%})")
++    print(f"Cost score    : {b_cost} → {a_cost}   (how token-efficient)")
++    print(f"Quality score : {b_quality} → {a_quality}   (how clear and complete)")
+ 
+     print("\nDetails for the optimized prompt:")
+     for name, (score, note) in details.items():
+@@ -111,19 +174,29 @@
+     compare_models(final)
+ 
+ 
+-if __name__ == "__main__":
+-    print("Paste your prompt, then press Enter on an empty line:")
++def read_prompt(stream=None):
++    """Read the whole prompt, including blank lines between paragraphs.
++    Stops at a line containing only END, or at end of input (Ctrl+Z then Enter on
++    Windows, Ctrl+D on Mac/Linux, or the end of piped input)."""
++    stream = stream or sys.stdin
++    if stream.isatty():
++        print("Paste your prompt. When you're done, type END on its own line and press Enter.")
+     lines = []
+-    while True:
+-        line = input()
+-        if line == "":
++    for line in stream:
++        if line.strip() == "END":
+             break
+-        lines.append(line)
+-    prompt = "\n".join(lines).strip()
++        lines.append(line.rstrip("\r\n"))
++    return "\n".join(lines).strip()
+ 
+-    if not prompt:
+-        print("Empty prompt.")
+-        exit()
+ 
+-    rules_version, final = pipeline(prompt)
+-    report(prompt, final)
++if __name__ == "__main__":
++    try:
++        prompt = read_prompt()
++        if not prompt:
++            print("Empty prompt.")
++            sys.exit()
++        rules_version, final = pipeline(prompt)
++        report(prompt, final)
++    except (KeyboardInterrupt, EOFError):
++        print("\nCancelled.")
++        sys.exit(1)
+--- base/model_health.py	2026-11-26 00:14:37.812916033 +0500
++++ w/model_health.py	2026-11-26 00:22:12.219056229 +0500
+@@ -62,7 +62,9 @@
+ 
+ # ---------- 3. speed test ----------
+ def benchmark(name):
+-    results = []
++    """Run the spell task RUNS times. Returns (best seconds, average seconds, average write speed),
++    or None if there were no runs."""
++    walls, speeds, reply = [], [], ""
+     for i in range(RUNS):
+         start = time.perf_counter()
+         r = client.chat(
+@@ -77,13 +79,18 @@
+         load = get(r, "load_duration", 0) / ns
+         p_tok, p_time = get(r, "prompt_eval_count", 0), get(r, "prompt_eval_duration", 0) / ns
+         e_tok, e_time = get(r, "eval_count", 0), get(r, "eval_duration", 0) / ns
+-        results.append(wall)
++        speed = e_tok / e_time if e_time else 0
++        walls.append(wall)
++        speeds.append(speed)
++        reply = r["message"]["content"].strip().replace("\n", " ")
+         print(f"   run {i + 1}: {wall:5.1f}s total | load {load:4.1f}s | "
+               f"read {p_tok} tok @ {p_tok / p_time if p_time else 0:5.1f} tok/s | "
+-              f"write {e_tok} tok @ {e_tok / e_time if e_time else 0:5.1f} tok/s")
+-    reply = r["message"]["content"].strip().replace("\n", " ")
++              f"write {e_tok} tok @ {speed:5.1f} tok/s")
++    if not walls:
++        print("   no runs (RUNS = 0)")
++        return None
+     print(f"   output: {reply[:120]}")
+-    return min(results), e_tok / e_time if e_time else 0
++    return min(walls), sum(walls) / len(walls), sum(speeds) / len(speeds)
+ 
+ 
+ # ---------- 4. what's loaded, and on CPU or GPU? ----------
+@@ -120,14 +127,16 @@
+             continue
+         try:
+             check_model(name)
+-            best, speed = benchmark(name)
+-            summary.append((name, best, speed))
++            result = benchmark(name)
++            if result:
++                summary.append((name, *result))
+         except ollama.ResponseError as e:
+             print(f"   ❌ error: {e}")
+ 
+     check_loaded()
+ 
+     if summary:
+-        print("\n5. Summary (best of", RUNS, "runs)")
+-        for name, best, speed in summary:
+-            print(f"   {name:<20} {best:5.1f}s per spell fix | writes {speed:5.1f} tok/s  {verdict(speed)}")
++        print(f"\n5. Summary ({RUNS} runs each)")
++        for name, best, avg, speed in summary:
++            print(f"   {name:<20} best {best:5.1f}s, average {avg:5.1f}s per spell fix | "
++                  f"writes {speed:5.1f} tok/s on average  {verdict(speed)}")
+--- base/optimizer.py	2026-11-26 00:14:37.812926343 +0500
++++ w/optimizer.py	2026-11-26 00:23:53.019917943 +0500
+@@ -1,11 +1,13 @@
+-import re 
++import re
++import sys
++import unicodedata
++from collections import Counter
+ from token_counter import count_tokens
+ 
+ FILLER = {
+     "i would like you to ": "",
+     "could you please ": "",
+     "can you please ": "",
+-    "please ": "",
+     "go ahead and ": "",
+     "in order to ": "to ",
+     "due to the fact that ": "because ",
+@@ -14,65 +16,143 @@
+     "it is important to note that ": "",
+     "basically ": "",
+     "actually ": "",
+-    " for me": "",
+ }
+ 
++# verbs that start a request; "please" right before one of these is politeness
++REQUEST_VERBS = {"write", "explain", "help", "make", "create", "give", "tell", "list", "fix", "generate",
++                 "summarize", "summarise", "translate", "send", "check", "show", "find", "provide",
++                 "describe", "analyze", "analyse", "convert", "rewrite", "do", "let", "use", "add",
++                 "remove", "keep", "read", "answer", "reply", "share", "suggest", "review", "correct",
++                 "improve", "update", "draft", "compare", "plan", "prepare", "calculate", "solve",
++                 "build", "design", "go", "note", "include"}
++
++# misspellings of "please" that are never real words, so they can go anywhere (lowercase only)
++PLEASE_TYPOS = r"(?:p{2,}l+e+a+s+e+|p+l+e+a+s+e{2,}|pl[sz]*z[sz]*|pls{2,}|plez+|pleez+)"
++
++
++def remove_please(text):
++    """Remove "please" only where it is clearly politeness: at the start of a sentence
++    or clause, or right before a request verb. Keep it when it is the topic or a verb
++    ("people say please", "don't please everyone")."""
++    text = re.sub(rf"\b{PLEASE_TYPOS}\b[ \t]*", "", text)
++
++    # at the start of the text, a line, or a clause (after . ! ? , ; :)
++    def at_start(m):
++        if m.group("w").isupper() and m.group("w").lower() != "please":
++            return m.group(0)                      # "PLS" is an acronym
++        return m.group("lead")
++    text = re.sub(r"(?P<lead>^|(?<=[.!?,;:])[ \t]+|(?<=\n))(?P<w>please|pls|plz)\b[.!,]?[ \t]*",
++                  at_start, text, flags=re.IGNORECASE)
++
++    # right before a request verb: "... and please write a poem"
++    def before_verb(m):
++        return "" if m.group(1).lower() in REQUEST_VERBS else m.group(0)
++    return re.sub(r"(?<![\w'])please[ \t]+(?=([A-Za-z]+))", before_verb, text, flags=re.IGNORECASE)
++
+ 
+ def remove_filler(text):
+     result = text
+     for phrase, replacement in FILLER.items():
+-        # \b = whole words only, so "please " can't match inside "pplease "
++        # \b = whole words only, so a phrase can't match inside another word
+         pattern = (r"\b" if phrase[0].isalnum() else "") + re.escape(phrase)
+         result = re.sub(pattern, replacement, result, flags=re.IGNORECASE)
+-    # misspelled or short forms of "please": plz, pls, plzz, pleaseee, pplease
+-    result = re.sub(r"\b(p+l+e*a*s+e*|pl[sz]+)\b\s*", "", result, flags=re.IGNORECASE)
++    result = remove_please(result)
++    # " for me" only right after a request verb ("summarize this article for me"),
++    # never in "Is this plan right for me?"
++    result = re.sub(r"\b((?:write|make|create|generate|find|summari[sz]e|draft|translate)\b[^.?!\n]{0,40}?)[ \t]+for me\b",
++                    r"\1", result, flags=re.IGNORECASE)
+     return result
+ 
++# Only these words are collapsed when repeated ("the the", "hello hello").
++# Other repeats may be intentional ("Bora Bora", "no no no", "knock knock").
++REPEATABLE = {"the", "a", "an", "is", "to", "of", "in", "on", "and", "or", "for", "it", "i", "be",
++              "are", "was", "that", "this", "with", "hello", "hi", "hey", "please", "thanks"}
++
+ def remove_repeated_words(text):
+-    # "hello hello" → "hello",  "the the" → "the"
+-    return re.sub(r"\b(\w+)(\s+\1\b)+", r"\1", text, flags=re.IGNORECASE)
++    # "hello hello" → "hello",  "the the" → "the"  (lowercase only, so names stay)
++    def collapse(m):
++        word = m.group(1)
++        return word if word.islower() and word in REPEATABLE else m.group(0)
++    return re.sub(r"\b(\w+)(?:[ \t]+\1\b)+", collapse, text)
+ 
+ def remove_decorations(text):
+-    # "---====" or "*****" → removed, but keeps "well-known" and "**bold**"
+-    return re.sub(r"([-=_*#~])\1{2,}", " ", text)
++    # only a line made of one repeated character ("-----", "=====", "*****") is removed;
++    # inline symbols like "***bold***", "===" or "!=" stay
++    return re.sub(r"(?m)^[ \t]*([-=*_])\1{2,}[ \t]*$\n?", "", text)
+ 
+ def collapse_whitespace(text):
+-    text = re.sub(r"[ \t]+", " ", text)     # many spaces/tabs → one space
+-    text = re.sub(r"\n{3,}", "\n\n", text)  # 3+ newlines → one blank line
+-    return text
++    text = re.sub(r"(?<=\S) {2,}", " ", text)   # runs of spaces inside a line → one space
++    text = re.sub(r"\n{3,}", "\n\n", text)      # 3+ newlines → one blank line
++    return text                                 # leading indentation and tabs are kept
++
++# real words with repeated letters
++STRETCH_OK = {"zzz", "zzzz", "sss", "brrr", "aaa", "aaaa", "www", "xxx", "mmm", "hmmm", "shhh",
++              "grrr", "ahhh", "ooo", "eee", "iii", "vvv"}
+ 
+ def shrink_stretched_letters(text):
+     # "appp" -> "app", "chaaaal" -> "chaal", "sureee" -> "suree" (the spell step fixes the rest)
+-    # only lowercase and never "w", so "www." and Roman numerals like "III" stay intact
+-    return re.sub(r"([a-vx-z])\1{2,}", r"\1\1", text)
++    # skips hex values (#fff, 0xfff), whitelisted words, and words with digits or capitals
++    def fix(m):
++        word = m.group(0)
++        if text[m.start() - 1:m.start()] == "#" or word.lower().startswith("0x"):
++            return word
++        if word.lower() in STRETCH_OK or any(c.isdigit() or c.isupper() for c in word):
++            return word
++        return re.sub(r"([a-vx-z])\1{2,}", r"\1\1", word)
++    return re.sub(r"\b\w+\b", fix, text)
+ 
+ def remove_keyboard_spam(text):
+-    # button-mashing like "plslplsplsplsplpsl": words made only of p, l, s, z (with both p and l)
+-    return re.sub(r"\b(?=[plsz]*p)(?=[plsz]*l)[plsz]{3,}\b\s*", "", text, flags=re.IGNORECASE)
++    # button-mashing like "plslplsplsplsplpsl": lowercase, 6+ letters made only of p, l, s, z,
++    # or one 2-3 letter chunk repeated 3+ times ("asdasdasd"). Capitals (PLS, LSP) are kept.
++    text = re.sub(r"\b(?=[plsz]*p)(?=[plsz]*l)[plsz]{6,}\b[ \t]*", "", text)
++    return re.sub(r"\b([a-z]{2,3})\1{2,}\b[ \t]*", "", text)
++
++CODE_CHARS = set("<>{};/\\|")
+ 
+ def remove_symbol_junk(text):
+     # 4+ mixed symbols like "???????_))(__)()(_(" -> "?"  (keeps one ? ! or . if the run started with it)
+-    def keep_first(m):
+-        return m.group(0)[0] if m.group(0)[0] in "?!." else " "
+-    return re.sub(r"(?:[^\w\s]|_){4,}", keep_first, text)
++    # keeps markdown lines (# heading, | table |) and code-like runs (<!--, **/*.py, my_var____name)
++    def clean_line(line):
++        if line.lstrip().startswith(("#", "|")) or re.fullmatch(r"\s*([-=*_])\1{2,}\s*", line):
++            return line                                     # markdown, or a divider line for remove_decorations
++        def keep_first(m):
++            run = m.group(0)
++            left, right = line[m.start() - 1:m.start()], line[m.end():m.end() + 1]
++            if CODE_CHARS & set(run):
++                return run                                  # looks like code or markup
++            if left.isalnum() and right.isalnum():
++                return run                                  # inside a word
++            return run[0] if run[0] in "?!." else " "
++        return re.sub(r"(?:[^\w\s]|_){4,}", keep_first, line)
++    return "\n".join(clean_line(l) for l in text.split("\n"))
+ 
+ def pre_clean(text):
+     """Cheap fixes that help the spell step: stretched letters, spam, symbol junk.
+     Quoted text and code stay protected."""
++    original = text
+     text, saved = protect(text)
+     text = shrink_stretched_letters(text)
+     text = remove_keyboard_spam(text)
+     text = remove_symbol_junk(text)
+     text = collapse_whitespace(text).strip()
+-    return restore(text, saved)
++    try:
++        return restore(text, saved)
++    except ValueError:
++        return original                   # never lose protected text
++
+ 
++ADDRESS_WORDS = r"(bhai|bro|sir|yaar|janab|there|team|all|everyone|baby|babe|babay|jaan|dost|friend)"
+ 
+ def remove_greeting(text):
+-    # removes greetings like "hello", "hi bhai", "salam sir" only at the START, as whole words
+-    return re.sub(
+-        r"^\s*(hello|hi|hey|dear|salam|salaam|assalam[u-]?\s?o?\s?alaikum|aoa)\b[,!.]?"
+-        r"(\s+((mere|meri|my|dear)\s+)?(bhai|bro|sir|yaar|janab|there|team|all|everyone|baby|babe|babay|jaan|dost|friend)\b[,!.]?)?\s*",
++    # removes greetings like "hello,", "hi bhai", "salam sir" only at the START, and only when
++    # followed by punctuation, an address word, or small talk -- so "Hello World program"
++    # and "Hey Jude lyrics" stay. Something must be left afterwards.
++    cleaned = re.sub(
++        r"^\s*(hello|hi|hey|dear|salam|salaam|assalam[u-]?\s?o?\s?alaikum|aoa)\b"
++        r"(?:\s*[,!.]+|\s+((mere|meri|my|dear)\s+)?" + ADDRESS_WORDS + r"\b[,!.]?"
++        r"|(?=\s+(how\s+(are|r)\s+(you|u)|kese|kaise|kesy|kya\s+haal)\b))\s*",
+         "", text, flags=re.IGNORECASE)
++    return cleaned if cleaned.strip() else text
+ 
+ def remove_pleasantries(text):
+     # "I hope you are doing well today." adds tokens but nothing to the task
+@@ -81,7 +161,8 @@
+ def remove_small_talk(text):
+     """Remove "how are you doing?" and "can you do that?" -- but only when
+     something else is left, because sometimes "how are you" IS the question."""
+-    cleaned = re.sub(r"\bhow (are|r) (you|u)( doing| today)?\s*[?.!]*\s*", "", text, flags=re.IGNORECASE)
++    # only a full "how are you" sentence: followed by ? . ! , or the end of the text
++    cleaned = re.sub(r"\bhow (are|r) (you|u)( doing| today)?\s*(?:[?.!,]+\s*|$)", "", text, flags=re.IGNORECASE)
+     # Roman Urdu: "kese ho aap", "kya haal chaal hai apka"
+     cleaned = re.sub(r"\b(kese|kaise|kesy|kaisay|kaisy|kesay|kesi|kaisi)\s+(ho|hain|hn|hai)(\s+(aap|ap|app|tum))?\s*[?.!]*\s*", "", cleaned, flags=re.IGNORECASE)
+     cleaned = re.sub(r"\bkya\s+haal(\s+chaal)?\s+(hai|he|h|hain)(\s+(apka|aapka|apkaa|tumhara))?\s*[?.!]*\s*", "", cleaned, flags=re.IGNORECASE)
+@@ -89,70 +170,144 @@
+     return cleaned if len(cleaned.split()) >= 3 else text
+ 
+ def remove_closing_thanks(text):
+-    # removes "Thank you so much in advance for your help!" etc., but only at the END
+-    return re.sub(
++    # removes "Thank you so much in advance for your help!" etc., but only at the END,
++    # and not when thanks is part of the task ("ends with thank you", "a speech ... Thank you.")
++    m = re.search(
+         r"[\s,]*\b(thank you|thanks|thx|shukriya|shukria)( so much| very much| a lot)?( in advance)?( for (your|the) help)?[.!]*\s*$",
+-        "", text, flags=re.IGNORECASE)
++        text, flags=re.IGNORECASE)
++    if not m:
++        return text
++    before = text[:m.start()]
++    if re.search(r"\b(with|say|says|saying|ends?|ending|note|write)\W*$", before, re.IGNORECASE):
++        return text
++    if re.search(r"\b(thank|thanks|shukriya)\b", before, re.IGNORECASE):
++        return text                                 # thanks is the topic of the prompt
++    return before
+ 
+ def collapse_punctuation(text):
+-    text = re.sub(r"([?!.])\1+", r"\1", text)   # ?? → ?   !!! → !
+-    text = re.sub(r"\s+([?!.,])", r"\1", text)  # "it ?" → "it?"
+-    text = re.sub(r"([?!])[.?!]+", r"\1", text)  # "?." → "?"
++    text = re.sub(r"([?!])\1+", r"\1", text)                # ?? → ?   !!! → !   (never .. or ...)
++    text = re.sub(r"[ \t]+([?!.,])(?=\s|$)", r"\1", text)   # "it ?" → "it?", but not ".NET" or "cd .."
++    text = re.sub(r"([?!])[.?!]+", r"\1", text)             # "?." → "?"
+     return text
+ 
+ def remove_duplicate_sentences(text):
+-    sentences = re.split(r"(?<=[.!?])\s+", text)   # split after . ! ?
++    # removes a sentence only if it repeats exactly and has 5+ words;
++    # keeps line breaks and never changes capitals
++    parts = re.split(r"(?<=[.!?])([ \t]+|\n+)", text)       # sentences, with the gaps between them
+     seen = set()
+-    kept = []
+-    for s in sentences:
+-        s = s.strip()
+-        key = s.lower()                  # compare ignoring capitals
+-        if s and key not in seen:
+-            seen.add(key)
+-            kept.append(s[:1].upper() + s[1:])   # capitalize each sentence
+-    return " ".join(kept)
++    out = []
++    for i in range(0, len(parts), 2):
++        sentence, gap = parts[i], (parts[i - 1] if i else "")
++        key = re.sub(r"\s+", " ", sentence.strip().lower())
++        if len(key.split()) >= 5 and key in seen:
++            continue                                         # drop the repeat and its gap
++        seen.add(key)
++        out.append(gap + sentence)
++    return "".join(out)
+ 
+ 
+ 
+ # Text inside quotes or code must never be changed (titles, code, exact data).
+-PROTECTED = re.compile(r"```.*?```|`[^`\n]*`|\"[^\"\n]*\"|“[^”\n]*”", re.DOTALL)
++# A single quote only counts when it wraps something, not the apostrophe in don't / it's.
++PROTECTED = re.compile(r"```.*?```|`[^`\n]*`|\"[^\"\n]*\"|“[^”\n]*”|‘[^’\n]*’|(?<![\w'])'[^'\n]+'(?!\w)", re.DOTALL)
++
++
++class Saved(list):
++    """The protected parts, plus the placeholder marker used for them."""
++    marker = "QXPH"
++
+ 
+ def protect(text):
+-    """Swap protected parts for placeholders the rules can't touch."""
+-    saved = []
++    """Swap protected parts for placeholders the rules can't touch.
++    The placeholder is made only of word characters (QXPH0QXPH), so no symbol rule
++    can split it, and the marker changes if the text already contains it."""
++    saved = Saved()
++    marker = "QXPH"
++    while marker in text:
++        marker += "Q"
++    saved.marker = marker
+     def stash(match):
+         saved.append(match.group(0))
+-        return f"\uE000{len(saved) - 1}\uE001"
++        return f"{marker}{len(saved) - 1}{marker}"
+     return PROTECTED.sub(stash, text), saved
+ 
+ def restore(text, saved):
+-    """Put the protected parts back."""
+-    return re.sub("\uE000(\\d+)\uE001", lambda m: saved[int(m.group(1))], text)
++    """Put the protected parts back. Raises ValueError if a placeholder was lost or
++    duplicated, so callers fall back to the original text instead of failing silently."""
++    marker = getattr(saved, "marker", "QXPH")
++    pattern = re.compile(rf"{marker}(\d+){marker}")
++    if sorted(int(i) for i in pattern.findall(text)) != list(range(len(saved))):
++        raise ValueError("a protected part was lost or duplicated")
++    return pattern.sub(lambda m: saved[int(m.group(1))], text)
++
++def normalize_quotes(text):
++    return text.replace("“", '"').replace("”", '"').replace("‘", "'").replace("’", "'")
+ 
+ def protected_parts(text):
+-    return PROTECTED.findall(text)
++    return [m.group(0) for m in PROTECTED.finditer(text)]
+ 
+ 
+ STOPWORDS = {"the", "and", "that", "this", "with", "for", "from", "your", "what", "when",
+              "which", "about", "into", "have", "will", "would", "should", "could", "there",
+              "want", "like", "something", "because", "feeling", "come", "just", "please",
+-             "very", "really", "some", "also", "make", "sure", "thank", "thanks", "tell"}
++             "very", "really", "some", "also", "make", "sure", "thank", "thanks", "tell",
++             "either", "answer", "must", "help", "them", "they", "then", "than", "been"}
+ 
+-NEGATIONS = r"(do not|don't|dont|does not|doesn't|must not|mustn't|should not|shouldn't|never|no|not|avoid|without|nahi|mat)"
++NEGATIONS = r"(do not|don't|dont|does not|doesn't|must not|mustn't|should not|shouldn't|never|no|not|avoid|without|nahi|mat|نہیں|نہ|مت)"
+ # generic verbs after a negation; the real rule is in the noun that follows ("do not include EXAMPLES")
+ GENERIC_VERBS = {"include", "want", "need", "give", "mention", "write", "make", "add", "show",
+-                 "provide", "type", "put", "send", "share"}
++                 "provide", "type", "put", "send", "share", "use", "more"}
++
++
++def script_of(text):
++    """Main writing system of a text: 'latin', 'arabic', 'cjk', 'devanagari', 'other' or 'none'."""
++    counts = Counter()
++    for ch in text:
++        if ch.isalpha():
++            name = unicodedata.name(ch, "")
++            if name.startswith("LATIN"):
++                counts["latin"] += 1
++            elif name.startswith("ARABIC"):
++                counts["arabic"] += 1
++            elif name.startswith(("CJK", "HIRAGANA", "KATAKANA", "HANGUL")):
++                counts["cjk"] += 1
++            elif name.startswith("DEVANAGARI"):
++                counts["devanagari"] += 1
++            else:
++                counts["other"] += 1
++    return counts.most_common(1)[0][0] if counts else "none"
++
++
++def _words(text):
++    """Words in any script (Unicode-aware), lowercased."""
++    return re.findall(r"[^\W\d_]+(?:'[^\W\d_]+)?", text.lower())
++
++
++def _count_number(num, text):
++    # whole numbers only: "5" does not match inside "500", "2" not inside "2024"
++    return len(re.findall(rf"(?<![\d.,]){re.escape(num)}(?![.,]?\d)", text))
++
++
++def _negated(word, words, window=4):
++    """True if some occurrence of `word` has a negation within the 4 words before it."""
++    for i, w in enumerate(words):
++        if w.startswith(word[:5]):
++            if re.search(rf"\b{NEGATIONS}\b", " ".join(words[max(0, i - window):i])):
++                return True
++    return False
++
+ 
+ def lost_constraints(before, after, check_subjects=True):
+     """Rules and limits that disappeared between two versions of a prompt:
+-    every number must survive, and every negative rule ("do not include examples")
+-    must keep its subject AND some negation word."""
++    every number must survive (as a whole number, as often as before), and every
++    negative rule ("do not include examples") must keep its subject with a negation
++    right before it."""
+     lost = []
+     low_after = after.lower()
+ 
+-    # 1. numbers: "500 words", "$899", "16GB"
+-    for num in re.findall(r"\d+(?:[.,]\d+)?", before):
+-        if num not in after:
++    # 1. numbers: "500 words", "$899", "16GB" -- whole numbers, counted
++    for num, n in Counter(re.findall(r"\d+(?:[.,]\d+)*", before)).items():
++        if _count_number(num, after) < n:
+             lost.append(num)
+ 
+     # 2. negative rules
+@@ -164,31 +319,60 @@
+         if n_after < n_before:
+             lost.append(f"{n_before - n_after} negation(s)")
+         return lost
+-    has_negation_after = re.search(rf"\b{NEGATIONS}\b", low_after) is not None
++    after_words = _words(after)
+     for m in re.finditer(rf"\b{NEGATIONS}\b((?:\s+[\w']+){{1,4}})", before.lower()):
+-        words = [w for w in re.findall(r"[a-z]+", m.group(2))
++        words = [w for w in _words(m.group(2))
+                  if len(w) > 3 and w not in STOPWORDS and w not in GENERIC_VERBS]
+-        if not words:
+-            continue
+-        kept = any(w[:5] in low_after for w in words)
+-        if not (kept and has_negation_after):
++        if words and not _negated(words[0], after_words):   # words[0] = what the rule is about
+             lost.append(f"{m.group(1)}{m.group(2)}".strip())
+     return lost
+ 
+ 
++def lost_requests(before, after):
++    """Requests joined with "and / also / plus" ("a poem ... and also a haiku ... and a limerick"):
++    the first content word after each one must survive."""
++    lost = []
++    after_words = _words(after)
++    for m in re.finditer(r"\b(and|also|plus)\b((?:\s+[\w']+){1,4})", before.lower()):
++        words = [w for w in _words(m.group(2))          # skip verbs: "and explain why..." asks nothing new
++                 if len(w) > 3 and w not in STOPWORDS and w not in GENERIC_VERBS and w not in REQUEST_VERBS]
++        if words and not any(a.startswith(words[0][:5]) for a in after_words):
++            lost.append(words[0])
++    return lost
++
++
+ def keyword_overlap(original, rewritten):
+     """Share of the original's key words still in the rewrite (0.0 to 1.0).
+-    Words are compared by their first 5 letters, so 'lyrics' matches 'lyrical'."""
++    Words are compared by their first 5 letters, so 'lyrics' matches 'lyrical'.
++    Works for any script; Chinese/Japanese/Korean are compared by character pairs."""
+     def keys(t):
+-        return {w[:5] for w in re.findall(r"[a-z]+", t.lower()) if len(w) > 3 and w not in STOPWORDS}
++        if script_of(t) == "cjk":
++            chars = [c for c in t if c.isalpha()]
++            return {a + b for a, b in zip(chars, chars[1:])}
++        min_len = 3 if script_of(t) in ("latin", "none") else 1
++        return {w[:5] for w in _words(t)
++                if len(w) > min_len and w not in STOPWORDS and w not in GENERIC_VERBS}
+     orig = keys(original)
+     if len(orig) < 4:
+         return 1.0      # too few key words to judge (e.g. short, misspelled prompts)
+     return len(orig & keys(rewritten)) / len(orig)
+ 
+ 
++COMMAND_WORDS = {"npm", "pip", "git", "cd", "ls", "sudo", "py", "node", "yarn", "curl", "wget", "www"}
++
++def capitalize_first(text):
++    """Capitalize the first letter, but not words like iPhone, npm, e.g., paths or URLs."""
++    first = text.split(None, 1)[0] if text.strip() else ""
++    if (not first or any(c.isupper() for c in first[1:]) or re.search(r"[./\\:_\-@\d]", first)
++            or first.lower() in COMMAND_WORDS):
++        return text
++    return text[:1].upper() + text[1:]
++
++
+ def optimize(text):
++    original = text
+     text, saved = protect(text)
++    original_start = text.strip().split(None, 1)[:1]
+     text = shrink_stretched_letters(text)
+     text = remove_keyboard_spam(text)
+     text = remove_symbol_junk(text)
+@@ -203,16 +387,20 @@
+     text = collapse_whitespace(text)
+     text = remove_duplicate_sentences(text)
+     text = text.strip().rstrip(",;").strip()
+-    text = text[:1].upper() + text[1:]      # capitalize the first letter
+-    return restore(text, saved)
++    if text.split(None, 1)[:1] != original_start:
++        text = capitalize_first(text)     # only when something was removed from the start
++    try:
++        return restore(text, saved)
++    except ValueError:
++        return original                   # never lose protected text
+ 
+ if __name__ == "__main__":
+     prompt = input("Paste your prompt: ")
+-    
++
+     if not prompt.strip():
+         print("Empty prompt, nothing to optimize.")
+-        exit() 
+-    
++        sys.exit()
++
+     better = optimize(prompt)
+ 
+     before = count_tokens(prompt)
+@@ -221,4 +409,4 @@
+ 
+     print("\nOriginal :", prompt)
+     print("Optimized:", better)
+-    print(f"\nTokens: {before} → {after}  (saved {saved}, {saved / before:.0%})")
+\ No newline at end of file
++    print(f"\nTokens: {before} → {after}  (saved {saved}, {saved / before:.0%})")
+--- base/scorer.py	2026-11-26 00:14:37.812938821 +0500
++++ w/scorer.py	2026-11-26 00:23:53.176047977 +0500
+@@ -1,4 +1,5 @@
+ import re
++import sys
+ from token_counter import count_tokens
+ from optimizer import optimize
+ 
+@@ -18,9 +19,12 @@
+ def score_efficiency(prompt, model):
+     """How much of the prompt is waste the optimizer can remove?"""
+     before = count_tokens(prompt, model)
++    if before == 0:
++        return 100, "empty prompt"
+     after = count_tokens(optimize(prompt), model)
+-    waste = (before - after) / before
+-    return round(100 * (1 - waste)), f"{before - after} of {before} tokens are removable filler"
++    waste = max(before - after, 0) / before
++    # on an already optimized prompt this measures what's left, so it's near 100
++    return round(100 * (1 - waste)), f"{before - after} of {before} tokens are remaining filler"
+ 
+ 
+ def score_structure(prompt):
+@@ -45,7 +49,7 @@
+ def score_budget(prompt, model):
+     """Is the prompt a sensible size for the model's context window?"""
+     tokens = count_tokens(prompt, model)
+-    used = tokens / CONTEXT_WINDOWS[model]
++    used = tokens / CONTEXT_WINDOWS.get(model, 128000)
+     if tokens < 8:
+         return 40, f"only {tokens} tokens, likely too little context"
+     if used > 0.5:
+@@ -85,7 +89,7 @@
+     prompt = input("Paste your prompt: ")
+     if not prompt.strip():
+         print("Empty prompt.")
+-        exit()
++        sys.exit()
+ 
+     overall, results = rate(prompt)
+     print(f"\nOverall score: {overall}/100  (grade {grade(overall)})\n")
+--- base/tests.py	2026-11-26 00:14:37.812946973 +0500
++++ w/tests.py	2026-11-26 00:23:33.044776142 +0500
+@@ -48,7 +48,7 @@
+      ["500 words", "easy to read", "blog post"], ["Hello", "I hope", "Thank", "basically", "go ahead"], None),
+     ("small talk kept when it IS the question",
+      "kese ho aap",
+-     [], [], "Kese ho aap"),
++     [], [], "kese ho aap"),      # was "Kese ho aap": rules no longer capitalize untouched text (B10)
+     ("small talk removed when there is a real request",
+      "hi how are you doing? please help me to write method for array reversal? can you do that?",
+      ["write method", "array reversal"], ["how are you", "can you do that"], None),
+@@ -72,6 +72,133 @@
+      "Please do not include any examples in your answer. Just explain what recursion is in simple terms, "
+      "actually I don't want any code either.",
+      ["do not include any examples", "don't want any code"], [], None),
++    # ---- regression tests for the bug list (A2, B1-B11, C12-C14) ----
++    ('A2 JSON with quoted keys survives',
++     'Parse {"a":{"b":{"c":[1]}}} please',
++     [], [], 'Parse {"a":{"b":{"c":[1]}}} please'),
++    ('B1 single-quoted words protected',
++     "Translate 'please' and 'thank you' into French.",
++     [], [], "Translate 'please' and 'thank you' into French."),
++    ("B1 single-quoted 'sss' protected",
++     "Explain the word 'sss' hissing",
++     [], [], "Explain the word 'sss' hissing"),
++    ("B1 apostrophes aren't treated as quotes",
++     "Hello, I don't know what it's for",
++     [], [], "I don't know what it's for"),
++    ("B2 'Hello World' is a topic",
++     'Hello World program in Java',
++     [], [], 'Hello World program in Java'),
++    ("B2 'Hey Jude' is a topic",
++     'Hey Jude lyrics meaning',
++     [], [], 'Hey Jude lyrics meaning'),
++    ("B2 'Dear Diary' is a topic",
++     'Dear Diary format: write an entry',
++     [], [], 'Dear Diary format: write an entry'),
++    ("B2 'hi' as the topic",
++     'hi in Spanish?',
++     [], [], 'hi in Spanish?'),
++    ("B3 'how are you' inside a question",
++     'How are you different from ChatGPT?',
++     [], [], 'How are you different from ChatGPT?'),
++    ("B3 'how are you' as grammar topic",
++     'Explain how are you used in English grammar',
++     [], [], 'Explain how are you used in English grammar'),
++    ('B4 thanks as part of the task',
++     'Write an email that ends with thank you',
++     [], [], 'Write an email that ends with thank you'),
++    ("B5 'for me' in a real question",
++     'Is this plan right for me?',
++     [], [], 'Is this plan right for me?'),
++    ("B6 'please' as the topic",
++     'Explain why people say please.',
++     [], [], 'Explain why people say please.'),
++    ("B6 'please' as a verb",
++     "Please don't please everyone",
++     [], [], "Don't please everyone"),
++    ("B6 'pleas' and 'Pleiades' kept",
++     'explain the Pleiades and pleas in court',
++     [], [], 'explain the Pleiades and pleas in court'),
++    ('B7 acronym PLS kept',
++     'Explain the PLS regression method',
++     [], [], 'Explain the PLS regression method'),
++    ('B7 acronym LSP kept',
++     'Explain LSP',
++     [], [], 'Explain LSP'),
++    ('B7 short p/l/s words kept',
++     'slp and lsp and pls and spl and psl',
++     [], [], 'slp and lsp and pls and spl and psl'),
++    ("B8 'Bora Bora' kept",
++     'Plan a trip to Bora Bora',
++     [], [], 'Plan a trip to Bora Bora'),
++    ("B8 'no no no no' kept",
++     'Write a song with the chorus no no no no',
++     [], [], 'Write a song with the chorus no no no no'),
++    ('B9 hex colours kept',
++     'Use color #fff and 0xfff',
++     [], [], 'Use color #fff and 0xfff'),
++    ("B9 'aaa battery' kept",
++     'aaa battery',
++     [], [], 'aaa battery'),
++    ('B10 short repeated list items kept',
++     'List 3 fruits. 1. Apple. 2. Banana. 1. Apple.',
++     [], [], 'List 3 fruits. 1. Apple. 2. Banana. 1. Apple.'),
++    ('B10 speech thanks kept',
++     'Write a speech. Thanks to all volunteers. Thank you.',
++     [], [], 'Write a speech. Thanks to all volunteers. Thank you.'),
++    ('B10 line breaks kept',
++     'Rules:\nBe short.\nBe kind.\nCite sources.',
++     [], [], 'Rules:\nBe short.\nBe kind.\nCite sources.'),
++    ('B10 no capitalizing inside sentences',
++     'e.g. the Nile and iPhone and npm and www.x.com',
++     [], [], 'e.g. the Nile and iPhone and npm and www.x.com'),
++    ('B10 iPhone at the start kept',
++     'iPhone tips',
++     [], [], 'iPhone tips'),
++    ('B10 command at the start kept',
++     'npm install express',
++     [], [], 'npm install express'),
++    ('B10 long exact repeat still removed',
++     'Summarize this article in three short points. Summarize this article in three short points.',
++     [], [], 'Summarize this article in three short points.'),
++    ('B11 no double period',
++     'Write 500 words. please. Not 500 words more.',
++     [], [], 'Write 500 words. Not 500 words more.'),
++    ('C12 leading indentation kept',
++     'Indented code:\n def f():\n return 1',
++     [], [], 'Indented code:\n def f():\n return 1'),
++    ('C12 tabs kept',
++     'name\tage\nali\t30',
++     [], [], 'name\tage\nali\t30'),
++    ('C13 markdown heading kept',
++     '### Step 1',
++     [], [], '### Step 1'),
++    ('C13 markdown table kept',
++     '| a | b |\n|---|---|\n| 1 | 2 |',
++     [], [], '| a | b |\n|---|---|\n| 1 | 2 |'),
++    ('C13 bold markers kept',
++     '***very bold***',
++     [], [], '***very bold***'),
++    ('C13 glob pattern kept',
++     'Match files **/*.py',
++     [], [], 'Match files **/*.py'),
++    ('C13 HTML comment kept',
++     'Fix <!-- comment --> in HTML',
++     [], [], 'Fix <!-- comment --> in HTML'),
++    ('C13 operators kept',
++     'explain != and ===',
++     [], [], 'explain != and ==='),
++    ('C13 underscores in names kept',
++     'rename my_var___name',
++     [], [], 'rename my_var___name'),
++    ('C13 standalone divider line removed',
++     'Intro\n-----\nText',
++     [], [], 'Intro\nText'),
++    ('C14 .NET and cd .. kept',
++     'Learn .NET and run cd ..',
++     [], [], 'Learn .NET and run cd ..'),
++    ('C14 ellipsis kept',
++     'Explain the ellipsis... and what comes next...',
++     [], [], 'Explain the ellipsis... and what comes next...'),
+ ]
+ 
+ # Known problems we'll fix later: shown as warnings, not failures
+@@ -120,11 +247,170 @@
+      "i dont want any kode", "i don't want any code", False),
+     ("spell step: dropped negation is caught",
+      "i dont want any kode", "i want any code", True),
++    ("A5 '5' lost while '500' stays is caught",
++     "Write exactly 5 bullet points about tea, max 500 words",
++     "Write bullet points about tea, max 500 words", True),
++    ("A5 '2' lost while '2024' stays is caught",
++     "Give 2 examples from 2024", "Give examples from 2024", True),
++    ("A5 a number used twice must stay twice",
++     "Write 3 tips, then 3 warnings", "Write 3 tips and warnings", True),
++    ("A6 flipped negation (Python/Rust) is caught",
++     "Do not use Python, use Rust to write a web server",
++     "Use Python, not Rust, to write a web server", True),
+     ("Roman Urdu negation kept",
+      "main kal office nahi aa sakta", "main kal office nahi aa sakta", False),
+ ]
+ 
+ 
++class FakeResponse(dict):
++    """Looks like an Ollama chat response."""
++    def __init__(self, content, done_reason="stop"):
++        super().__init__(message={"content": content}, done_reason=done_reason)
++        self.done_reason = done_reason
++
++
++class FakeClient:
++    """Stands in for Ollama: returns a fixed reply and counts calls."""
++    def __init__(self, content, done_reason="stop"):
++        self.content, self.done_reason, self.calls = content, done_reason, 0
++    def chat(self, **kwargs):
++        self.calls += 1
++        self.kwargs = kwargs
++        return FakeResponse(self.content, self.done_reason)
++
++
++def safety_checks():
++    """(name, passed?) for checks on main.py and llm_optimizer.py, using fake model outputs."""
++    import llm_optimizer as L
++    import main as M
++    from optimizer import protect, restore, optimize
++    from scorer import rate
++    from token_counter import count_tokens
++
++    saved_client, saved_cache, saved_save, saved_ai = L.client, dict(L.CACHE), L.save_cache, M.USE_AI
++    L.save_cache = lambda: None                      # never touch the real cache file in tests
++    L.CACHE.clear()
++    out = []
++    def quiet(fn, *args):
++        with redirect_stdout(io.StringIO()):
++            return fn(*args)
++    try:
++        # A1: prompts the rules remove completely
++        M.USE_AI = False
++        for p in ["hello hello", "Thanks!", "please", "hi", "pls pls pls"]:
++            _, final = quiet(M.pipeline, p)
++            out.append((f"A1 {p!r} keeps a non-empty prompt", final.strip() != ""))
++        try:
++            rate("")
++            out.append(("A1 rate('') doesn't crash", True))
++        except ZeroDivisionError:
++            out.append(("A1 rate('') doesn't crash", False))
++
++        # A2: placeholders
++        text, saved = protect('Keep "x" and QXPH0QXPH literally')
++        out.append(("A2 placeholder marker changes if already in text", restore(text, saved) == 'Keep "x" and QXPH0QXPH literally'))
++        out.append(("A2 private-use characters don't crash", optimize('a "\ue000b\ue001" c') == 'a "\ue000b\ue001" c'))
++        try:
++            restore("placeholder gone", saved)
++            out.append(("A2 restore() raises when a placeholder is lost", False))
++        except ValueError:
++            out.append(("A2 restore() raises when a placeholder is lost", True))
++
++        # A3: reading input
++        out.append(("A3 multi-paragraph prompt is read fully",
++                    M.read_prompt(io.StringIO("Para one.\n\nPara two.\n")) == "Para one.\n\nPara two."))
++        out.append(("A3 END marker stops reading",
++                    M.read_prompt(io.StringIO("Line 1\nEND\nignored\n")) == "Line 1"))
++        out.append(("A3 piped input without trailing newline",
++                    M.read_prompt(io.StringIO("no newline at end")) == "no newline at end"))
++
++        # A4: output limits and cut-off output
++        long_prompt = "word " * 800
++        opts = L.generation_options(L.SPELL_SYSTEM, long_prompt)
++        out.append(("A4 num_predict grows with the prompt", opts["num_predict"] >= count_tokens(long_prompt) * 2))
++        out.append(("A4 num_ctx fits system + prompt + output",
++                    opts["num_ctx"] >= count_tokens(L.SPELL_SYSTEM) + count_tokens(long_prompt) + opts["num_predict"]))
++        L.client = FakeClient("<prompt>half of the ans", done_reason="length")
++        try:
++            L.spell_fix("some prompt to fix")
++            out.append(("A4 done_reason=length is rejected", False))
++        except L.OutputCutOff:
++            out.append(("A4 done_reason=length is rejected", True))
++        L.client = FakeClient("<prompt>cut off without a closing tag")
++        try:
++            L.spell_fix("another prompt to fix")
++            out.append(("A4 missing </prompt> is rejected", False))
++        except L.OutputCutOff:
++            out.append(("A4 missing </prompt> is rejected", True))
++        words = [f"item{i}" for i in range(400)]
++        ok, _ = M.spelling_is_safe(" ".join(words), " ".join(words[:250]))
++        out.append(("A4 spell fix cut to 62% is rejected", not ok))
++        L.client = FakeClient("<prompt>should not be called</prompt>")
++        M.USE_AI = True
++        quiet(M.pipeline, "please explain " + "this topic in detail " * 400)
++        out.append(("A4 prompts over MAX_AI_TOKENS skip the AI", L.client.calls == 0))
++        M.USE_AI = False
++
++        # A6 / A7: compression must not change the meaning
++        ok, _ = M.compression_is_safe("Do not use Python, use Rust to write a web server",
++                                      "Use Python, not Rust, to write a web server")
++        out.append(("A6 flipped negation is rejected", not ok))
++        ok, _ = M.compression_is_safe("Write a poem about the ocean and also a haiku about mountains and a limerick about cats",
++                                      "Write a poem about the ocean and a haiku about mountains.")
++        out.append(("A6 dropped request is rejected", not ok))
++        ok, _ = M.compression_is_safe("Do not include any examples in your answer. Just explain what recursion is in simple terms, I don't want any code either.",
++                                      "Explain recursion in simple terms. No examples, no code.")
++        out.append(("A6 a good compression is still accepted", ok))
++        ok, _ = M.compression_is_safe("مہربانی کر کے میرے باس کو ایک ای میل لکھیں کہ میں کل دفتر نہیں آؤں گا کیونکہ میں بیمار ہوں",
++                                      "Write a cake recipe")
++        out.append(("A7 Urdu replaced by English is rejected", not ok))
++        ok, _ = M.compression_is_safe("请帮我写一封邮件给我的老板，说明我明天因为生病不能来上班",
++                                      "写一个蛋糕食谱")
++        out.append(("A7 Chinese with unrelated rewrite is rejected", not ok))
++
++        # D16: curly quotes
++        ok, _ = M.compression_is_safe("Please analyze the song “Let It Be” by The Beatles and explain why it became so popular.",
++                                      'Analyze the song "Let It Be" by The Beatles and explain why it became popular.')
++        out.append(("D16 curly vs straight quotes count as the same", ok))
++        out.append(("D16 the user's curly quotes come back",
++                    M.restore_quote_style("Analyze “Let It Be” now", 'Analyze "Let It Be"') == "Analyze “Let It Be”"))
++
++        # D17: clean() without tags
++        out.append(("D17 chatty opener removed",
++                    L.clean("Sure! Here is the optimized prompt: Write a poem.") == "Write a poem."))
++        out.append(("D17 all paragraphs kept",
++                    L.clean("Write a poem.\n\nKeep it under 50 words.") == "Write a poem.\n\nKeep it under 50 words."))
++        out.append(("D17 a real 'Output format:' line is kept",
++                    L.clean("Output format: JSON with two fields") == "Output format: JSON with two fields"))
++
++        # D18: Roman Urdu translated by the spell model
++        ok, _ = M.spelling_is_safe("mujhe ek email likh do ke main kal office nahi aa sakta",
++                                   "write me an email that I cannot come to the office tomorrow")
++        out.append(("D18 Roman Urdu translated to English is rejected", not ok))
++
++        # D19: only accepted answers are cached
++        L.client = FakeClient("<prompt>Write a product description for a laptop.</prompt>")
++        L.spell_fix("rite a leter")
++        out.append(("D19 ask() doesn't cache by itself", L.CACHE == {}))
++        L.remember_spell("rite a leter", "write a letter")
++        out.append(("D19 accepted answer is cached", L.spell_fix("rite a leter") == ("write a letter", 0.0)))
++        L.forget_spell("rite a leter")
++        out.append(("D19 rejected answer is removed from the cache", L.CACHE == {}))
++
++        # D20 and C15
++        out.append(("D20 capitalized typo at sentence start is found", L.needs_spell_fix("Halp me write a letter.")))
++        try:
++            count_tokens("hello", "gpt-3.5")
++            out.append(("C15 unknown model doesn't crash", True))
++        except KeyError:
++            out.append(("C15 unknown model doesn't crash", False))
++    finally:
++        L.client, L.save_cache, M.USE_AI = saved_client, saved_save, saved_ai
++        L.CACHE.clear()
++        L.CACHE.update(saved_cache)
++    return out
++
++
+ def check(result, must, must_not, exact):
+     low = result.lower()                       # word checks ignore capitals
+     problems = [f"missing {m!r}" for m in must if m.lower() not in low]
+@@ -153,6 +439,12 @@
+             print(f"  ❌ {name}\n     lost_constraints returned {lost}")
+         else:
+             print(f"  ✅ {name}")
++    print("\nSAFETY CHECKS (fake model outputs, no Ollama needed)")
++    for name, passed in safety_checks():
++        if not passed:
++            failed += 1
++        print(f"  {'✅' if passed else '❌'} {name}")
++    print("\nKNOWN ISSUES")
+     for name, prompt, must, must_not, exact in KNOWN_ISSUES:
+         result = optimize(pre_clean(prompt))
+         ok = not check(result, must, must_not, exact)
+--- base/token_counter.py	2026-11-26 00:14:37.812960165 +0500
++++ w/token_counter.py	2026-11-26 00:23:53.192149161 +0500
+@@ -1,3 +1,4 @@
++import sys
+ import tiktoken
+ 
+ MODELS = {
+@@ -6,14 +7,31 @@
+ }
+ 
+ 
++DEFAULT_ENCODING = "o200k_base"
++_ENCODERS = {}          # loaded once, reused on every call
++_WARNED = set()
++
++
++def get_encoder(model="gpt-4o"):
++    """The tokenizer for a model. Unknown models fall back to o200k_base with a warning."""
++    name = MODELS.get(model)
++    if name is None:
++        if model not in _WARNED:
++            print(f"(unknown model '{model}', counting tokens with {DEFAULT_ENCODING})", file=sys.stderr)
++            _WARNED.add(model)
++        name = DEFAULT_ENCODING
++    if name not in _ENCODERS:
++        _ENCODERS[name] = tiktoken.get_encoding(name)
++    return _ENCODERS[name]
++
++
+ def count_tokens(text, model="gpt-4o"):
+     """Return the number of tokens."""
+-    enc = tiktoken.get_encoding(MODELS[model])
+-    return len(enc.encode(text))
++    return len(get_encoder(model).encode(text))
+ 
+ def show_tokens(text, model="gpt-4o"):
+     """Print each token wrapped in [brackets]."""
+-    enc = tiktoken.get_encoding(MODELS[model])
++    enc = get_encoder(model)
+     ids = enc.encode(text)
+     pieces = [enc.decode([i]) for i in ids]
+     print("Tokens:", "".join(f"[{p}]" for p in pieces))
