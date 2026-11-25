@@ -61,7 +61,27 @@ def remove_duplicate_sentences(text):
 
 
 
+# Text inside quotes or code must never be changed (titles, code, exact data).
+PROTECTED = re.compile(r"```.*?```|`[^`\n]*`|\"[^\"\n]*\"|“[^”\n]*”")
+
+def protect(text):
+    """Swap protected parts for placeholders the rules can't touch."""
+    saved = []
+    def stash(match):
+        saved.append(match.group(0))
+        return f"\uE000{len(saved) - 1}\uE001"
+    return PROTECTED.sub(stash, text), saved
+
+def restore(text, saved):
+    """Put the protected parts back."""
+    return re.sub("\uE000(\\d+)\uE001", lambda m: saved[int(m.group(1))], text)
+
+def protected_parts(text):
+    return PROTECTED.findall(text)
+
+
 def optimize(text):
+    text, saved = protect(text)
     text = remove_repeated_words(text)
     text = remove_greeting(text)
     text = remove_filler(text)
@@ -70,7 +90,8 @@ def optimize(text):
     text = collapse_whitespace(text)
     text = remove_duplicate_sentences(text)
     text = text.strip()
-    return text[:1].upper() + text[1:]      # capitalize the first letter
+    text = text[:1].upper() + text[1:]      # capitalize the first letter
+    return restore(text, saved)
 
 if __name__ == "__main__":
     prompt = input("Paste your prompt: ")

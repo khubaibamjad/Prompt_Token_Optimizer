@@ -1,5 +1,5 @@
 from token_counter import count_tokens, compare_models
-from optimizer import optimize
+from optimizer import optimize, protected_parts
 from llm_optimizer import llm_optimize
 from scorer import rate, grade, split_scores
 
@@ -11,7 +11,10 @@ def pipeline(prompt):
     if USE_AI and count_tokens(rules_version) > 15:
         try:
             ai_version = optimize(llm_optimize(rules_version))   # clean the AI output with the rules too
-            if count_tokens(ai_version)<count_tokens(rules_version):
+            missing = [p for p in protected_parts(rules_version) if p not in ai_version]
+            if missing:
+                print(f"(AI changed protected text {missing}, keeping the rules version)")
+            elif count_tokens(ai_version)<count_tokens(rules_version):
                 final=ai_version
             else:
                 print("(AI rewrite wasn't shorter, keeping the rules version)")
