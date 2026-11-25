@@ -25,3 +25,26 @@ def report(prompt, final):
     before_tokens = count_tokens(prompt)
     after_tokens = count_tokens(final)
     saved = before_tokens - after_tokens
+
+    print("\n" + "=" * 50)
+    print("ORIGINAL :", prompt)
+    print("OPTIMIZED:", final)
+    print("=" * 50)
+    print(f"Tokens : {before_tokens} → {after_tokens}  (saved {saved}, {saved / before_tokens:.0%})")
+    print(f"Score  : {before_score} ({grade(before_score)}) → {after_score} ({grade(after_score)})")
+
+    print("\nDetails for the optimized prompt:")
+    for name, (score, note) in details.items():
+        print(f"  {name:<12} {score:>3}/100   {note}")
+
+    compare_models(final)
+
+
+if __name__ == "__main__":
+    prompt = input("Paste your prompt: ").strip()
+    if not prompt:
+        print("Empty prompt.")
+        exit()
+
+    rules_version, final = pipeline(prompt)
+    report(prompt, final)
