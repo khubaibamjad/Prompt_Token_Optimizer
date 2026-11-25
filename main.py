@@ -1,5 +1,5 @@
 from token_counter import count_tokens, compare_models
-from optimizer import optimize, protected_parts
+from optimizer import optimize, protected_parts, keyword_overlap
 from llm_optimizer import llm_optimize
 from scorer import rate, grade, split_scores
 
@@ -11,9 +11,13 @@ def pipeline(prompt):
     if USE_AI and count_tokens(rules_version) > 15:
         try:
             ai_version = optimize(llm_optimize(rules_version))   # clean the AI output with the rules too
+            print(f"(AI suggested, {count_tokens(ai_version)} tokens: {ai_version[:200]})")
             missing = [p for p in protected_parts(rules_version) if p not in ai_version]
+            overlap = keyword_overlap(rules_version, ai_version)
             if missing:
                 print(f"(AI changed protected text {missing}, keeping the rules version)")
+            elif overlap < 0.4:
+                print(f"(AI kept only {overlap:.0%} of the key words, it probably answered instead of rewriting, keeping the rules version)")
             elif count_tokens(ai_version)<count_tokens(rules_version):
                 final=ai_version
             else:
