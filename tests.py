@@ -261,6 +261,29 @@ RULE_TESTS = [
     ("R3 'can you' mid-sentence kept",
      'I wonder if you can you write it',
      [], [], 'I wonder if you can you write it'),
+    # ---- round 4 regression tests ----
+    ("R4 'I want you to' removed",
+     'I want you to build a task app',
+     [], [], 'Build a task app'),
+    ("R4 'I need you to' removed",
+     'I need you to summarize this article',
+     [], [], 'Summarize this article'),
+    ("R4 'Make sure' -> 'Ensure'",
+     'Make sure passwords are encrypted using BCrypt.',
+     [], [], 'Ensure passwords are encrypted using BCrypt.'),
+    ("R4 'make sure that' -> 'ensure'",
+     'Also, make sure that the app is responsive.',
+     [], [], 'Also, ensure the app is responsive.'),
+    # ---- round 5 regression tests ----
+    ("R5 'some kind of' -> 'an' before a vowel",
+     'There should also be some kind of admin panel.',
+     [], [], 'There should also be an admin panel.'),
+    ("R5 'Some sort of' -> 'A'",
+     'Some sort of report is needed.',
+     [], [], 'A report is needed.'),
+    ("R5 'obviously' removed",
+     'Make it simple, obviously not like Amazon.',
+     [], [], 'Make it simple, not like Amazon.'),
 ]
 
 # Known problems we'll fix later: shown as warnings, not failures
@@ -327,6 +350,15 @@ CONSTRAINT_TESTS = [
      "Avoid using jargon or technical terms.", "Avoid jargon and technical terms.", False),
     ("R2-1 'never modifies' kept as 'without modifying'",
      "Sort the list and never modifies the original list.", "Sort the list without modifying the original list.", False),
+    ("R5 'not ... of other sellers' kept as 'only their own'",
+     "I want sellers to see their own orders but not the orders of other sellers.",
+     "Sellers see only their own orders.", False),
+    ("R5 'only' can't hide a flipped negation",
+     "Do not use Python, use Rust to write a web server",
+     "Use only Python and Rust to write a web server", True),
+    ("R5 'without rewriting' kept",
+     "Design it so features can be added without rewriting everything.",
+     "Design it so features can be added without rewriting.", False),
     ("Roman Urdu negation kept",
      "main kal office nahi aa sakta", "main kal office nahi aa sakta", False),
 ]
@@ -521,6 +553,60 @@ def safety_checks():
         out.append((f"R3 the chatty leave prompt ends up as a short request ({final!r})",
                     final == "Write email for leave?"))
         L.CACHE.clear()                              # don't leak cached answers into later checks
+
+        # Round 4: long technical prompt
+        tech = ("I want you to build a full-stack app. The frontend should use React and the backend should "
+                "use Spring Boot. Make sure it is responsive on mobile devices and desktop screens.")
+        out.append(("R4 'frontend'/'backend' aren't typos, so the spell step is skipped",
+                    not L.needs_spell_fix(tech)))
+
+        class DropsThenKeeps:
+            """First rewrite drops 'desktop'; the retry (which gets feedback) keeps it."""
+            def __init__(self):
+                self.retry_notes = []
+            def chat(self, model, messages, **kwargs):
+                user = messages[1]["content"]
+                retry = "rejected because" in user
+                self.retry_notes.append(retry)
+                text = ("Build a full-stack app: React frontend, Spring Boot backend, responsive on mobile"
+                        + (" and desktop." if retry else "."))
+                return FakeResponse(f"<prompt>{text}</prompt>")
+        L.client = DropsThenKeeps()
+        M.USE_AI = True
+        _, final = quiet(M.pipeline, tech)
+        M.USE_AI = False
+        out.append(("R4 rejected compression gets one retry with feedback", L.client.retry_notes == [False, True]))
+        out.append(("R4 the retry's rewrite is used", "desktop" in final and len(final) < len(tech)))
+        L.CACHE.clear()
+
+        # Round 5: marketplace prompt
+        out.append(("R5 'admin' and 'overcomplicate' aren't typos",
+                    not L.needs_spell_fix("Build an admin panel. Don't overcomplicate it.")))
+        out.append(("R5 a real typo is still found", L.needs_spell_fix("Bild an admin panel for the shop.")))
+
+        shop = ("I want sellers to see their own orders but not the orders of other sellers. "
+                "Don't overcomplicate it, but don't make it too basic either. Customers can track orders.")
+        class FirstDropsRules:
+            """First rewrite drops the negative rules; the retry gets the full sentences and keeps them."""
+            def __init__(self):
+                self.notes = []
+            def chat(self, model, messages, **kwargs):
+                user = messages[1]["content"]
+                self.notes.append(user)
+                if "rejected because" in user:
+                    text = ("Sellers see only their own orders, not other sellers' orders. "
+                            "Don't overcomplicate it, but don't make it too basic. Customers track orders.")
+                else:
+                    text = "Sellers see their orders. Keep it simple. Customers track orders."
+                return FakeResponse(f"<prompt>{text}</prompt>")
+        L.client = FirstDropsRules()
+        M.USE_AI = True
+        _, final = quiet(M.pipeline, shop)
+        M.USE_AI = False
+        out.append(("R5 retry feedback quotes the full original sentence",
+                    len(L.client.notes) == 2 and "don't make it too basic either" in L.client.notes[1].lower()))
+        out.append(("R5 retry that keeps every rule is accepted", "don't make it too basic" in final.lower()))
+        L.CACHE.clear()
 
         # D16: curly quotes
         ok, _ = M.compression_is_safe("Please analyze the song “Let It Be” by The Beatles and explain why it became so popular.",

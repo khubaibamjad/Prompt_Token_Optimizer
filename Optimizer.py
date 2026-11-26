@@ -6,6 +6,8 @@ from token_counter import count_tokens
 
 FILLER = {
     "i would like you to ": "",
+    "i want you to ": "",
+    "i need you to ": "",
     "could you please ": "",
     "can you please ": "",
     "go ahead and ": "",
@@ -16,6 +18,7 @@ FILLER = {
     "it is important to note that ": "",
     "basically ": "",
     "actually ": "",
+    "obviously ": "",
 }
 
 # verbs that start a request; "please" right before one of these is politeness
@@ -74,6 +77,13 @@ def remove_filler(text):
         pattern = (r"\b" if phrase[0].isalnum() else "") + re.escape(phrase)
         result = re.sub(pattern, replacement, result, flags=re.IGNORECASE)
     result = remove_please(result)
+    # "some kind of admin panel" -> "an admin panel"
+    result = re.sub(r"\b([Ss])ome (?:kind|sort) of (?=(\w))",
+                    lambda m: ("A" if m.group(1) == "S" else "a") + ("n " if m.group(2).lower() in "aeiou" else " "),
+                    result)
+    # "make sure (that) X" -> "ensure X", keeping a capital at the start of a sentence
+    result = re.sub(r"\b([Mm])ake sure(?: that)?\b",
+                    lambda m: "Ensure" if m.group(1) == "M" else "ensure", result)
     # "(please) can you write ..." at the start of a sentence -> "write ..."; only before a request verb,
     # so a real question like "Can you swim?" stays
     def can_you(m):
@@ -298,7 +308,10 @@ STOPWORDS = {"the", "and", "that", "this", "with", "for", "from", "your", "what"
 # words that are never the subject of a rule or request ("avoid USING jargon", "and WANTS protein")
 NOT_SUBJECTS = {"want", "wants", "wanted", "need", "needs", "like", "sound", "seem", "look", "feel",
                 "keep", "try", "eat", "use", "using", "make", "made", "does", "never", "avoid",
-                "without", "nahi", "dont", "don't", "doesn't", "mustn't", "shouldn't"}
+                "without", "nahi", "dont", "don't", "doesn't", "mustn't", "shouldn't",
+                # vague nouns that just mean "the thing we're building"
+                "system", "application", "platform", "everything", "something", "anything",
+                "thing", "things", "stuff", "solution"}
 # Roman Urdu function words: they carry no meaning and are often dropped in a good rewrite
 ROMAN_URDU_FUNCTION = {"ek", "apne", "meri", "mera", "kyunke", "ke", "ko", "ka", "ki", "main", "hai", "do"}
 
@@ -353,13 +366,27 @@ def _content_words(text, extra_skip=()):
     return plain or words
 
 
-def _negated(word, words, window=4):
-    """True if some occurrence of `word` has a negation within the 4 words before it."""
+def _negated(word, words, window=4, allow_only=False):
+    """True if some occurrence of `word` has a negation within the 4 words before it.
+    With allow_only, "only" also counts ("not the orders of other sellers" = "only their own orders")."""
+    marker = rf"\b({NEGATIONS[1:-1]}|only)\b" if allow_only else rf"\b{NEGATIONS}\b"
     for i, w in enumerate(words):
         if _same_word(w, word):
-            if re.search(rf"\b{NEGATIONS}\b", " ".join(words[max(0, i - window):i])):
+            if re.search(marker, " ".join(words[max(0, i - window):i])):
                 return True
     return False
+
+
+def sentences_with(text, fragments):
+    """The full sentences of `text` that contain each fragment (used to tell the AI exactly what to keep)."""
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    found = []
+    for frag in fragments:
+        for sent in sentences:
+            if frag.lower() in sent.lower() and sent not in found:
+                found.append(sent)
+                break
+    return found
 
 
 def lost_constraints(before, after, check_subjects=True):
@@ -387,8 +414,10 @@ def lost_constraints(before, after, check_subjects=True):
     after_words = _words(after)
     for m in re.finditer(rf"\b{NEGATIONS}\b((?:\s+[\w']+){{1,4}})", before.lower()):
         words = _content_words(m.group(2))
+        # "only" may stand in for the negation only in rules about others ("not ... of other sellers")
+        allow_only = re.search(r"\b(other|others|else|anyone|anybody)\b", m.group(2)) is not None
         # kept if at least one subject word survives with a negation right before it
-        if words and not any(_negated(w, after_words) for w in words):
+        if words and not any(_negated(w, after_words, allow_only=allow_only) for w in words):
             lost.append(f"{m.group(1)}{m.group(2)}".strip())
     return lost
 

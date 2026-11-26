@@ -2,7 +2,7 @@ import re
 import sys
 from token_counter import count_tokens, compare_models
 from optimizer import (optimize, pre_clean, protected_parts, keyword_overlap, lost_constraints,
-                       lost_requests, normalize_quotes, script_of)
+                       lost_requests, normalize_quotes, script_of, sentences_with)
 import llm_optimizer
 from llm_optimizer import (spell_fix, llm_optimize, needs_spell_fix, MAX_AI_TOKENS, MODEL, SPELL_MODEL,
                            remember_spell, forget_spell, remember_compression, forget_compression)
@@ -170,19 +170,32 @@ def pipeline(prompt):
     # Step 3: AI compression, only worth it for longer prompts
     final = rules_version
     if use_ai and count_tokens(rules_version) > 8:
-        try:
-            raw, secs = llm_optimize(rules_version)
+        feedback = ""
+        for attempt in (1, 2):                       # one retry, told what was wrong
+            label = "3 AI" if attempt == 1 else "3 AI retry"
+            try:
+                raw, secs = llm_optimize(rules_version, feedback)
+            except Exception as e:
+                print(f"  [{label:<11}] skipped: {e}")
+                break
             short = optimize(raw)                    # clean the AI output with the rules too
             ok, why = compression_is_safe(rules_version, short)
             if ok:
                 remember_compression(rules_version, raw)
                 final = restore_quote_style(rules_version, short)
-                show("3 AI " + (f"{secs:.1f}s" if secs else "cache"), final)
-            else:
-                forget_compression(rules_version)
-                print(f"  [3 AI       ] rejected: {why} -> {short[:100]}")
-        except Exception as e:
-            print(f"  [3 AI       ] skipped: {e}")
+                show(label + " " + (f"{secs:.1f}s" if secs else "cache"), final)
+                break
+            forget_compression(rules_version)
+            print(f"  [{label:<11}] rejected: {why} -> {short[:300]}")
+            # only retry when the model left something out; other problems won't improve
+            if not why.startswith(("dropped requests", "lost rules or numbers", "kept only")):
+                break
+            # quote the full original sentences, so the model knows exactly what to keep
+            missing = lost_constraints(rules_version, short) + lost_requests(rules_version, short)
+            keep = sentences_with(rules_version, missing)
+            feedback = why.replace("dropped requests:", "dropped these requests:")
+            if keep:
+                feedback += ". It must still say everything in these sentences: " + " ".join(f'"{k}"' for k in keep)
     return rules_version, final
 
 def report(prompt, final):

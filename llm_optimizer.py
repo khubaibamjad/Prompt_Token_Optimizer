@@ -130,11 +130,12 @@ def _field(response, key):
     return value
 
 
-def ask(system, prompt, model):
+def ask(system, prompt, model, note=""):
     """Send one prompt to the local model and return (cleaned reply, seconds).
     Uses the cache when the same prompt was accepted before (seconds = 0).
+    `note` is extra feedback for a retry ("you dropped: desktop").
     Raises OutputCutOff if the model ran out of room before finishing."""
-    key = cache_key(model, system, prompt)
+    key = cache_key(model, system, prompt + note)
     if key in CACHE:
         return CACHE[key], 0.0
 
@@ -144,7 +145,7 @@ def ask(system, prompt, model):
             model=model,
             messages=[
                 {"role": "system", "content": system},
-                {"role": "user", "content": f"Original: {prompt}\nOutput:"},
+                {"role": "user", "content": f"Original: {prompt}\n{note}Output:"},
             ],
             options=generation_options(system, prompt),   # temperature 0, sized limits
             keep_alive="30m",         # keep the model loaded for 30 minutes
@@ -153,7 +154,7 @@ def ask(system, prompt, model):
         # model not downloaded? use the main model instead
         if e.status_code == 404 and model != MODEL:
             print(f"  (model '{model}' not found, using '{MODEL}'. Run: ollama pull {model})")
-            return ask(system, prompt, MODEL)
+            return ask(system, prompt, MODEL, note)
         raise
     seconds = time.perf_counter() - start
 
@@ -168,8 +169,17 @@ def ask(system, prompt, model):
 # texting short forms and real-but-usually-wrong words a dictionary can't catch
 SLANG = {"u", "r", "ur", "ya", "dat", "da", "dis", "plz", "pls", "thx", "luv", "hlp", "wat", "wht",
          "wid", "coz", "cuz", "bcoz", "b4", "gr8", "n", "msg", "rite", "nd", "im", "dont", "cant", "wont"}
-TECH_WORDS = ["json", "api", "gpt", "llm", "ai", "tiktoken", "ollama", "python", "javascript", "sql",
-              "html", "css", "url", "regex", "github", "git", "chatgpt", "claude", "gemma", "app"]
+TECH_WORDS = ["json", "api", "apis", "gpt", "llm", "ai", "tiktoken", "ollama", "python", "javascript", "sql",
+              "html", "css", "url", "regex", "github", "git", "chatgpt", "claude", "gemma", "app",
+              # common tech terms the dictionary doesn't know (so they aren't treated as typos)
+              "frontend", "backend", "fullstack", "devops", "dto", "dtos", "jwt", "bcrypt", "postgresql",
+              "postgres", "mysql", "mongodb", "typescript", "nodejs", "reactjs", "springboot", "docker",
+              "kubernetes", "microservice", "microservices", "middleware", "async", "yaml", "config",
+              "repo", "localhost", "signup", "login", "logout", "dataset", "datasets", "chatbot",
+              "webhook", "webhooks", "schema", "env", "npm", "pip", "cli", "ui", "ux", "sdk", "oauth",
+              "crud", "orm", "graphql", "redis", "nginx", "linux", "ci", "cd", "codebase", "refactor",
+              "refactoring", "scalable", "maintainable", "responsive", "frontends", "backends",
+              "admin", "admins", "dashboard", "ecommerce", "checkout", "signin", "username", "usernames"]
 
 try:
     from spellchecker import SpellChecker
@@ -195,7 +205,13 @@ def needs_spell_fix(text):
     words = [w for w in words if w.islower()]         # skip names and acronyms (Ali, GPT)
     if any(w in SLANG for w in words):
         return True
-    return bool(SPELLER.unknown([w.strip("'") for w in words if len(w) > 1]))
+    unknown = SPELLER.unknown([w.strip("'") for w in words if len(w) > 1])
+    # a long word that is just another form of a known word ("overcomplicate" vs
+    # "overcomplicated") is a real word missing from the dictionary, not a typo
+    typos = [w for w in unknown
+             if not (len(w) >= 7 and any(c.startswith(w) or w.startswith(c)
+                                         for c in (SPELLER.candidates(w) or [])))]
+    return bool(typos)
 
 
 def spell_fix(prompt, model=None):
@@ -208,8 +224,11 @@ def forget_spell(prompt, model=None):
     forget(SPELL_SYSTEM, model or SPELL_MODEL, prompt)
 
 
-def llm_optimize(prompt):
-    return ask(COMPRESS_SYSTEM, prompt, MODEL)
+def llm_optimize(prompt, feedback=""):
+    """Compress a prompt. `feedback` explains why the previous try was rejected."""
+    note = (f"Your previous rewrite was rejected because it {feedback}. "
+            f"Rewrite again and keep every requirement.\n") if feedback else ""
+    return ask(COMPRESS_SYSTEM, prompt, MODEL, note)
 
 def remember_compression(prompt, reply):
     remember(COMPRESS_SYSTEM, MODEL, prompt, reply)
