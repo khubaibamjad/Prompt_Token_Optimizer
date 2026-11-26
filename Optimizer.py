@@ -178,6 +178,44 @@ def remove_symbol_junk(text):
         return re.sub(r"(?:[^\w\s]|_){4,}", keep_first, line)
     return "\n".join(clean_line(l) for l in text.split("\n"))
 
+# texting spellings fixed instantly, without the AI (lowercase only, so acronyms like "UR" stay)
+SLANG_FIXES = {
+    "dont": "don't", "doesnt": "doesn't", "didnt": "didn't", "cant": "can't", "isnt": "isn't",
+    "arent": "aren't", "wasnt": "wasn't", "werent": "weren't", "shouldnt": "shouldn't",
+    "wouldnt": "wouldn't", "couldnt": "couldn't", "havent": "haven't", "hasnt": "hasn't",
+    "im": "I'm", "ive": "I've", "wanna": "want to", "gonna": "going to", "gotta": "have to",
+    "lemme": "let me", "gimme": "give me", "dunno": "don't know", "u": "you", "ur": "your",
+    "rn": "now", "bc": "because", "cuz": "because", "coz": "because", "bcoz": "because",
+    "b4": "before", "whats": "what's", "thats": "that's", "wat": "what",
+}
+
+def fix_slang(text):
+    """dont -> don't, u -> you, rn -> now, wanna -> want to, lone "i" -> "I"."""
+    text = re.sub(r"(?<![\w'-])(" + "|".join(map(re.escape, SLANG_FIXES)) + r")(?![\w'-])",
+                  lambda m: SLANG_FIXES[m.group(1)], text)
+    return re.sub(r"(?<![\w'.-])i(?![\w'.)-])", "I", text)
+
+
+def remove_casual_filler(text):
+    """Chatty filler from casual prompts: "yo so", "u know what i mean", "if that makes sense lol",
+    "kinda", "and yeah", "like way better", "and all that stuff"."""
+    rules = [
+        (r"^\s*(?:(?:yo|ok|okay|so|well|um+|uh+|yeah)\b[,!.]?\s+)+(?=\S)", ""),          # opening "yo so ..."
+        (r"[,\s]*\b(?:you|u) know what I mean\b", ""),                                  # keep the "." after it
+        (r"[,\s]*\bif (?:that|it) makes sense\b", ""),
+        (r"[,\s]*\b(?:lol|lmao|haha+|hehe+|tbh|ngl)\b", ""),
+        (r"\b(?:and )?yeah,?\s+", lambda m: "and " if m.group(0).startswith("and") else ""),
+        (r"\b(?:kinda|sorta|tho)\b\s*", ""),
+        # "like keep it simple" -- only before a command or pronoun, so "Like Apple, ..." stays
+        (r"(^|(?<=[.!?,;:])\s+)like,?\s+(?=(?:keep|make|just|I|you|it|we|maybe|so|honestly)\b)", r"\1"),
+        (r"\b(\w+er)\s+like\s+(?=(?:way|so|super|totally|really)\b)", r"\1 "),            # "better like way better", not "I like way ..."
+        (r",?\s+and (?:all )?(?:that )?stuff\b(\.?)", ", etc."),                          # no "etc.." 
+    ]
+    for pattern, repl in rules:
+        text = re.sub(pattern, repl, text, flags=re.IGNORECASE)
+    return text
+
+
 def pre_clean(text):
     """Cheap fixes that help the spell step: stretched letters, spam, symbol junk.
     Quoted text and code stay protected."""
@@ -186,6 +224,8 @@ def pre_clean(text):
     text = shrink_stretched_letters(text)
     text = remove_keyboard_spam(text)
     text = remove_symbol_junk(text)
+    text = fix_slang(text)
+    text = remove_casual_filler(text)     # before the spell check: "lol" and friends aren't typos
     text = collapse_whitespace(text).strip()
     try:
         return restore(text, saved)
@@ -583,6 +623,7 @@ def optimize(text):
     text = remove_pleasantries(text)
     text = remove_small_talk(text)
     text = remove_filler(text)
+    text = remove_casual_filler(text)
     text = remove_decorations(text)
     text = collapse_punctuation(text)
     text = collapse_whitespace(text)

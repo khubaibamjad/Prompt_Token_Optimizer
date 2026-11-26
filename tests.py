@@ -294,6 +294,37 @@ RULE_TESTS = [
     ('R9 filler mid-sentence stays lowercase',
      'We need it, basically for testing.',
      [], [], 'We need it, for testing.'),
+    # ---- round 11 regression tests ----
+    ("R11 opening 'yo so' removed, lone 'i' -> 'I'",
+     'yo so i want a logo',
+     [], [], 'I want a logo'),
+    ("R11 'u know what i mean' removed, period kept",
+     'make it better u know what i mean. its old',
+     [], [], 'make it better. its old'),
+    ("R11 'if that makes sense lol' removed",
+     'keep it simple if that makes sense lol.',
+     [], [], 'keep it simple.'),
+    ('R11 dont/wanna fixed without AI',
+     'dont break stuff and i wanna keep the layout',
+     [], [], "don't break stuff and I want to keep the layout"),
+    ("R11 'and all that stuff' -> 'etc.' (no double period)",
+     'fix buttons and cards and all that stuff.',
+     [], [], 'fix buttons and cards, etc.'),
+    ('R11 acronyms, U-turn and i.e. untouched',
+     'Follow the U-turn sign and the UR code, i.e. this one',
+     [], [], 'Follow the U-turn sign and the UR code, i.e. this one'),
+    ("R11 'I like way better fonts' kept",
+     'I like way better fonts',
+     [], [], 'I like way better fonts'),
+    ("R11 'Like Apple, ...' kept",
+     'Like Apple, make it clean.',
+     [], [], 'Like Apple, make it clean.'),
+    ("R11 filler 'like' removed",
+     'make it look better like way better. like keep it simple',
+     [], [], 'make it look better way better. keep it simple'),
+    ("R11 'and yeah' / 'kinda' / 'tho' removed",
+     'and yeah dont add animations, its kinda outdated tho',
+     [], [], "and don't add animations, its outdated"),
 ]
 
 # Known problems we'll fix later: shown as warnings, not failures
@@ -823,6 +854,12 @@ def safety_checks():
         out.append(("R10 rejected chunks in fast mode stay exactly as written",
                     final.count("Do not use paid services") == huge.count("Do not use paid services")))
         L.CACHE.clear()
+
+        # Round 11: casual prompts need no spell AI call
+        casual = ("yo so basically i want my website to look better u know what i mean. its kinda outdated rn. "
+                  "keep it simple if that makes sense lol. dont change everything tho and dont add random animations.")
+        out.append(("R11 casual prompt skips the spell AI after the slang rules", not L.needs_spell_fix(M.pre_clean(casual))))
+        out.append(("R11 casual prompt keeps both 'don't' rules", optimize(M.pre_clean(casual)).count("don't") == 2))
 
         # D16: curly quotes
         ok, _ = M.compression_is_safe("Please analyze the song “Let It Be” by The Beatles and explain why it became so popular.",

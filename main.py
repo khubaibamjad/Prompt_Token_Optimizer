@@ -189,7 +189,7 @@ def pipeline(prompt):
             final = compress(rules_version, "3 AI") or rules_version
     return rules_version, final
 
-def compress(text, label, verbose=True, min_overlap=0.6, retry=True):
+def compress(text, label, verbose=True, min_overlap=0.6, retry=True, reasons=None):
     """Shorten `text` with the AI: one try, plus one retry told what was missing.
     Returns the safe shorter version, or None if both tries were rejected."""
     feedback = ""
@@ -209,6 +209,8 @@ def compress(text, label, verbose=True, min_overlap=0.6, retry=True):
                 show(name + " " + (f"{secs:.1f}s" if secs else "cache"), short)
             return short
         forget_compression(text)
+        if reasons is not None:
+            reasons.append(why)                      # so chunk mode can say why it kept a chunk
         if verbose:
             print(f"  [{name:<11}] rejected: {why} -> {short[:300]}")
         # only retry when the model left something out; other problems won't improve
@@ -250,15 +252,16 @@ def compress_in_chunks(text):
         chunk, gap = chunks[i]
         prefix = LIST_PREFIX.match(chunk)
         prefix = prefix.group(0) if prefix else ""
+        reasons = []
         short = compress(chunk[len(prefix):], "3 AI", verbose=False,
-                         min_overlap=CHUNK_MIN_OVERLAP, retry=not big)
-        return i, chunk, gap, prefix, short
+                         min_overlap=CHUNK_MIN_OVERLAP, retry=not big, reasons=reasons)
+        return i, chunk, gap, prefix, short, reasons
 
     workers = PARALLEL if big else 1
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [pool.submit(shorten, i) for i in work]
         for n, future in enumerate(as_completed(futures), 1):
-            i, chunk, gap, prefix, short = future.result()
+            i, chunk, gap, prefix, short, reasons = future.result()
             elapsed = time.perf_counter() - start
             eta = elapsed / n * (len(work) - n)
             timing = f"  ({elapsed:.0f}s, ~{eta:.0f}s left)" if len(work) > 3 else ""
@@ -267,7 +270,8 @@ def compress_in_chunks(text):
                 print(f"  [{label:<11}] {count_tokens(chunk):>3} → {count_tokens(prefix + short):>3} tokens ✅{timing}")
                 out[i] = prefix + short + gap
             else:
-                print(f"  [{label:<11}] {count_tokens(chunk):>3} tokens, kept as is (no safe shorter version){timing}")
+                why = f": {reasons[-1][:90]}" if reasons else ""
+                print(f"  [{label:<11}] {count_tokens(chunk):>3} tokens, kept as is{why}{timing}")
     joined = "".join(out).strip()
     # final check on the whole result (numbers, quotes, language, rules across chunks)
     ok, why = compression_is_safe(text, joined, CHUNK_MIN_OVERLAP)

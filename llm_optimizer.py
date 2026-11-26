@@ -191,7 +191,8 @@ TECH_WORDS = ["json", "api", "apis", "gpt", "llm", "ai", "tiktoken", "ollama", "
               "refactoring", "scalable", "maintainable", "responsive", "frontends", "backends",
               "admin", "admins", "dashboard", "ecommerce", "checkout", "signin", "username", "usernames",
               "auth", "db", "utils", "util", "params", "args", "async", "boolean", "enum", "enums", "json",
-              "endpoint", "endpoints", "timestamp", "timestamps", "metadata", "plugin", "plugins", "toolbar"]
+              "endpoint", "endpoints", "timestamp", "timestamps", "metadata", "plugin", "plugins", "toolbar",
+              "etc", "vs", "eg", "ie"]
 
 try:
     from spellchecker import SpellChecker
