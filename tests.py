@@ -428,7 +428,7 @@ def safety_checks():
     """(name, passed?) for checks on main.py and llm_optimizer.py, using fake model outputs."""
     import llm_optimizer as L
     import main as M
-    from optimizer import protect, restore, optimize, keyword_overlap
+    from optimizer import protect, restore, optimize, keyword_overlap, _same_word, lost_constraints
     from scorer import rate
     from token_counter import count_tokens
 
@@ -860,6 +860,59 @@ def safety_checks():
                   "keep it simple if that makes sense lol. dont change everything tho and dont add random animations.")
         out.append(("R11 casual prompt skips the spell AI after the slang rules", not L.needs_spell_fix(M.pre_clean(casual))))
         out.append(("R11 casual prompt keeps both 'don't' rules", optimize(M.pre_clean(casual)).count("don't") == 2))
+
+        # Round 12: a good whole-prompt rewrite of a casual prompt must pass; bad ones must not
+        from optimizer import _descriptive, NEGATIONS
+        site = optimize(M.pre_clean(
+            "yo so basically i have this website already and i want to make it look better like way better u know what i mean. "
+            "its kinda outdated rn and doesnt really look professional. i want it to look modern clean and premium but not too "
+            "fancy or over designed. like keep it simple but make it look expensive if that makes sense lol. dont change "
+            "everything tho because the website is already working and i dont wanna break stuff. just improve the design and "
+            "make the spacing better and fonts better and colors better and buttons and cards and all that stuff. also make "
+            "sure it works on mobile because rn some things look weird on mobile. and yeah dont add random animations "
+            "everywhere just because modern websites have animations. i want something that actually looks professional not "
+            "some random ai generated template. first check whats wrong then fix it."))
+        ideal = ("Redesign my working website to look modern, clean, premium and professional: simple but expensive, "
+                 "not too fancy or over-designed. Don't change everything or break anything. Improve spacing, fonts, colors, "
+                 "buttons and cards. Fix mobile layout issues. Don't add random animations; avoid a generic AI-template look. "
+                 "First check what's wrong, then fix it.")
+        ok, why = M.compression_is_safe(site, ideal)
+        out.append(("R12 a good ~50% rewrite of the casual prompt is accepted" + ("" if ok else f" ({why})"), ok))
+        bad = {
+            "drops 'don't add animations'": ideal.replace("Don't add random animations; avoid", "Avoid"),
+            "flips 'not too fancy'": ideal.replace("not too fancy or over-designed", "fancy and richly designed"),
+            "drops 'first check, then fix'": ideal.replace(" First check what's wrong, then fix it.", ""),
+            "drops 'don't change everything'": ideal.replace("Don't change everything or break anything. ", ""),
+            "drops mobile": ideal.replace(" Fix mobile layout issues.", ""),
+            "drops fonts and colors": ideal.replace("spacing, fonts, colors, buttons and cards", "spacing"),
+            "invents 'No images.'": ideal + " No images.",
+        }
+        for name, version in bad.items():
+            ok, _ = M.compression_is_safe(site, version)
+            out.append((f"R12 rewrite that {name} is rejected", not ok))
+        low = "it doesn't really look professional and some things aren't working. don't add animations."
+        found = {m.group(0).split()[0]: _descriptive(low, m) for m in re.finditer(rf"\b{NEGATIONS}\b(?=((?:\s+[\w']+){{1,4}}))", low)}
+        out.append(("R12 'it doesn't look professional' is a description, 'don't add' is a rule",
+                    found.get("doesn't") is True and found.get("don't") is False))
+        out.append(("R12 short words don't fake-match ('I'/images, 'but'/buttons, everywhere/everything)",
+                    not _same_word("i", "images") and not _same_word("but", "buttons")
+                    and lost_constraints("Don't add animations everywhere.", "Don't change everything.") != []))
+
+        class WholeModel:
+            def __init__(self):
+                self.calls = 0
+            def chat(self, model, messages, **kwargs):
+                self.calls += 1
+                return FakeResponse(f"<prompt>{ideal}</prompt>")
+        L.client = WholeModel()
+        M.USE_AI = True
+        log = io.StringIO()
+        with redirect_stdout(log):
+            _, final = M.pipeline(site)
+        M.USE_AI = False
+        out.append(("R12 a medium plain prompt is shortened in ONE whole-prompt call",
+                    "3 AI whole" in log.getvalue() and L.client.calls == 1 and final == ideal))
+        L.CACHE.clear()
 
         # D16: curly quotes
         ok, _ = M.compression_is_safe("Please analyze the song “Let It Be” by The Beatles and explain why it became so popular.",

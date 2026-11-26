@@ -18,6 +18,9 @@ USE_AI = True
 # prompts longer than this are shortened in chunks of a few sentences: a small model
 # keeps every rule much more reliably in short pieces, and one bad piece only costs that piece
 CHUNK_ABOVE = 80        # tokens
+# plain prompts up to this size are first shortened in ONE call, so the AI can merge repeated
+# ideas across sentences; chunks are the fallback (structured documents always use chunks)
+WHOLE_FIRST_MAX = 400   # tokens
 CHUNK_SIZE = 60         # tokens per chunk
 # a few sentences have few key words, so a good paraphrase ("platform" -> "marketplace") changes a
 # big share of them; chunks still get every other check (rules, numbers, requests, quotes, language)
@@ -184,10 +187,20 @@ def pipeline(prompt):
     final = rules_version
     if use_ai and count_tokens(rules_version) > 8:
         if count_tokens(rules_version) > CHUNK_ABOVE:
-            final = compress_in_chunks(rules_version)
+            final = None
+            if count_tokens(rules_version) <= WHOLE_FIRST_MAX and is_plain_prose(rules_version):
+                final = compress(rules_version, "3 AI whole")
+            if final is None:
+                final = compress_in_chunks(rules_version)
         else:
             final = compress(rules_version, "3 AI") or rules_version
     return rules_version, final
+
+def is_plain_prose(text):
+    """No headings, lists, tables or code: safe to rewrite as one piece."""
+    return "```" not in text and not any(STRUCTURE_LINE.match(l) or LIST_PREFIX.match(l)
+                                         for l in text.splitlines())
+
 
 def compress(text, label, verbose=True, min_overlap=0.6, retry=True, reasons=None):
     """Shorten `text` with the AI: one try, plus one retry told what was missing.

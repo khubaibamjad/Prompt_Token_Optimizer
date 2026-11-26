@@ -32,7 +32,7 @@ REQUEST_VERBS = {"write", "explain", "help", "make", "create", "give", "tell", "
                  "describe", "analyze", "analyse", "convert", "rewrite", "do", "let", "use", "add",
                  "remove", "keep", "read", "answer", "reply", "share", "suggest", "review", "correct",
                  "improve", "update", "draft", "compare", "plan", "prepare", "calculate", "solve",
-                 "build", "design", "go", "note", "include"}
+                 "build", "design", "go", "note", "include", "ensure"}
 
 # misspellings of "please" that are never real words, so they can go anywhere (lowercase only)
 PLEASE_TYPOS = r"(?:p{2,}l+e+a+s+e+|p+l+e+a+s+e{2,}|pl[sz]*z[sz]*|pls{2,}|plez+|pleez+)"
@@ -367,7 +367,12 @@ NOT_SUBJECTS = {"want", "wants", "wanted", "need", "needs", "like", "sound", "se
                 "without", "nahi", "dont", "don't", "doesn't", "mustn't", "shouldn't",
                 # vague nouns that just mean "the thing we're building"
                 "system", "application", "platform", "everything", "something", "anything",
-                "thing", "things", "stuff", "solution"}
+                "thing", "things", "stuff", "solution",
+                # judgments, not subjects: "make the spacing BETTER" is about spacing
+                "better", "worse", "more", "less", "good", "nice", "nicer", "great", "best", "really",
+                # adverbs: "don't add animations EVERYWHERE" is about animations
+                "everywhere", "anywhere", "somewhere", "nowhere", "always", "ever", "still", "even",
+                "here", "today", "anymore", "maybe", "probably"}
 # Roman Urdu function words: they carry no meaning and are often dropped in a good rewrite
 ROMAN_URDU_FUNCTION = {"ek", "apne", "meri", "mera", "kyunke", "ke", "ko", "ka", "ki", "main", "hai", "do"}
 
@@ -419,7 +424,11 @@ def _same_word(a, b):
     "oversimplification"); a short stem only needs to start the other (dict / dictionaries)."""
     a, b = _stem(a), _stem(b)
     short, long_ = sorted((a, b), key=len)
-    if len(short) <= 4:
+    if len(short) < 3:
+        return a == b                     # "I" is not the start of "images"
+    if len(short) == 3:                   # "cod"/"code" yes, "but"/"button" no
+        return long_.startswith(short) and len(long_) - len(short) <= 2
+    if len(short) == 4:
         return long_.startswith(short)
     return a[:5] == b[:5]
 
@@ -498,6 +507,24 @@ def sentences_with(text, fragments):
     return found
 
 
+# "it doesn't look professional" / "some things aren't working" describe the current problem,
+# they aren't instructions -- unlike "don't add animations" or "the API must not expose entities"
+STATE_VERBS = {"look", "looks", "seem", "seems", "feel", "feels", "appear", "appears", "work", "works",
+               "working", "load", "loads", "render", "renders", "fit", "fits", "display", "displays"}
+
+def _descriptive(text, m):
+    """True if the negation in match `m` describes how things are now, not a rule."""
+    neg = m.group(1)
+    before = text[:m.start()].split()[-1:] or [""]
+    aux = neg in {"doesn't", "does not", "don't", "do not"} and before[0] in {"it", "its", "it's", "this", "that",
+                                                                          "they", "everything", "nothing", "things",
+                                                                          "site", "website", "app", "page"}
+    aux = aux or (neg == "not" and before[0] in {"is", "are", "was", "were", "does", "did"})
+    aux = aux or neg == "doesn't" and before[0] not in {"i", "we", "you"}
+    words = [w for w in _words(m.group(2)) if w not in {"really", "quite", "very", "even", "yet", "always"}]
+    return aux and bool(words) and words[0] in STATE_VERBS
+
+
 def lost_constraints(before, after, check_subjects=True):
     """Rules and limits that disappeared between two versions of a prompt:
     every number must survive (as a whole number, as often as before), and every
@@ -521,7 +548,10 @@ def lost_constraints(before, after, check_subjects=True):
             lost.append(f"{n_before - n_after} negation(s)")
         return lost
     after_words = _words(after)
-    for m in re.finditer(rf"\b{NEGATIONS}\b((?:\s+[\w']+){{1,4}})", before.lower()):
+    low_before = before.lower()
+    for m in re.finditer(rf"\b{NEGATIONS}\b(?=((?:\s+[\w']+){{1,4}}))", low_before):
+        if _descriptive(low_before, m):
+            continue                                   # "it doesn't look professional" isn't a rule
         words = _content_words(m.group(2))
         # "only" may stand in for the negation only in rules about others ("not ... of other sellers")
         allow_only = re.search(r"\b(other|others|else|anyone|anybody)\b", m.group(2)) is not None
@@ -535,7 +565,10 @@ def added_constraints(before, after):
     """Negative rules in `after` that `before` never had: "Before coding, plan..." -> "No code." """
     added = []
     before_words = _words(before)
-    for m in re.finditer(rf"\b{NEGATIONS}\b((?:\s+[\w']+){{1,4}})", after.lower()):
+    low_after = after.lower()
+    for m in re.finditer(rf"\b{NEGATIONS}\b(?=((?:\s+[\w']+){{1,4}}))", low_after):
+        if _descriptive(low_after, m):
+            continue
         words = _content_words(m.group(2))
         # "only" in the original also counts ("see only their own" -> "not other sellers'")
         if words and not any(_negated(w, before_words, allow_only=True) for w in words):
@@ -563,9 +596,9 @@ def lost_requests(before, after):
     the first content word after each one must survive."""
     lost = []
     after_words = _words(after)
-    for m in re.finditer(r"\b(and|also|plus)\b((?:\s+[\w']+){1,4})", before.lower()):
-        # skip verbs ("and explain why...") and negations ("and never modifies...")
-        words = _content_words(m.group(2), extra_skip=REQUEST_VERBS)
+    for m in re.finditer(r"\b(and|also|plus)\b(?=((?:\s+[\w']+){1,5}))", before.lower()):
+        # skip verbs ("and explain why...", "also ensure it works on MOBILE") and negations
+        words = _content_words(m.group(2), extra_skip=REQUEST_VERBS | STATE_VERBS)
         if not words:
             # only a verb follows ("and explain how everything will work"): the verb is the request.
             # Just a real request verb right after "and" -- not helpers like do/give/make/use
