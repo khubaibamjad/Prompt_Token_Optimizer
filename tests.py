@@ -199,6 +199,46 @@ RULE_TESTS = [
     ('C14 ellipsis kept',
      'Explain the ellipsis... and what comes next...',
      [], [], 'Explain the ellipsis... and what comes next...'),
+    # ---- round 2 regression tests ----
+    ("R2-2 capitalize after removed 'pls' at sentence start",
+     "he said 'hi' and then left. pls summarize",
+     [], [], "he said 'hi' and then left. Summarize"),
+    ("R2-2 capitalize after removed 'please also'",
+     'write it in python. please also add comments',
+     [], [], 'write it in python. Also add comments'),
+    ('R2-2 capitalize after possessive apostrophes',
+     "It's the students' books and the teachers' pens. please explain",
+     [], [], "It's the students' books and the teachers' pens. Explain"),
+    ('R2-2 capitalize after an unbalanced quote',
+     'Unbalanced quote: "hello world. Please explain.',
+     [], [], 'Unbalanced quote: "hello world. Explain.'),
+    ('R2-2 no capital after a comma',
+     'Done, please explain',
+     [], [], 'Done, explain'),
+    ('R2-2 npm stays lowercase after removed please',
+     'Fix this. please npm install it',
+     [], [], 'Fix this. npm install it'),
+    ('R2-2 iPhone unchanged after removed please',
+     'Use iPhone. please iPhone tips',
+     [], [], 'Use iPhone. iPhone tips'),
+    ("R2-3 mid-sentence 'pls' removed",
+     'krta hun pls plslplsplsplsplpsl leik do na ???????_))(__)()(_(',
+     [], [], 'krta hun leik do na?'),
+    ("R2-3 'the pls tool' kept",
+     'Explain LSP (language server protocol) and the pls tool',
+     [], [], 'Explain LSP (language server protocol) and the pls tool'),
+    ("R2-3 'pls command' kept",
+     'Run the pls command',
+     [], [], 'Run the pls command'),
+    ("R2-3 mid-sentence 'plz' removed",
+     'can you plz write a poem',
+     [], [], 'can you write a poem'),
+    ("R2-4 repeated 'pls' fully collapsed before a request",
+     'pls pls pls write a poem',
+     [], [], 'Write a poem'),
+    ("R2-4 repeated 'thx' collapsed, then removed as closing thanks",
+     'Write a poem. thx thx thx',
+     [], [], 'Write a poem.'),
 ]
 
 # Known problems we'll fix later: shown as warnings, not failures
@@ -257,6 +297,14 @@ CONSTRAINT_TESTS = [
     ("A6 flipped negation (Python/Rust) is caught",
      "Do not use Python, use Rust to write a web server",
      "Use Python, not Rust, to write a web server", True),
+    ("R2-1 '10' kept as '10-year-old'",
+     "Explain it to a 10 year old child.", "Explain it to a 10-year-old.", False),
+    ("R2-1 '7' kept as '7-day', '16' as '16GB'",
+     "Create a 7 day plan for a 16 GB laptop", "Create a 7-day plan for a 16GB laptop", False),
+    ("R2-1 'avoid USING jargon': jargon is the subject",
+     "Avoid using jargon or technical terms.", "Avoid jargon and technical terms.", False),
+    ("R2-1 'never modifies' kept as 'without modifying'",
+     "Sort the list and never modifies the original list.", "Sort the list without modifying the original list.", False),
     ("Roman Urdu negation kept",
      "main kal office nahi aa sakta", "main kal office nahi aa sakta", False),
 ]
@@ -367,6 +415,53 @@ def safety_checks():
         ok, _ = M.compression_is_safe("请帮我写一封邮件给我的老板，说明我明天因为生病不能来上班",
                                       "写一个蛋糕食谱")
         out.append(("A7 Chinese with unrelated rewrite is rejected", not ok))
+
+        # Round 2, section 1: good compressions must be accepted, bad ones rejected
+        good = [
+            ("Avoid using jargon or technical terms. Explain how vaccines work to a 10 year old child.",
+             "Explain how vaccines work to a 10-year-old. Avoid jargon and technical terms."),
+            ("Could you write a cover letter for a software engineer role and make it sound confident but not arrogant?",
+             "Write a confident, not arrogant, cover letter for a software engineer role."),
+            ("Write a Python function that sorts a list of dictionaries by the age key and never modifies the original list.",
+             "Write a Python function to sort a list of dicts by age without modifying the original list."),
+            ("Create a 7 day meal plan for a vegetarian who does not eat eggs and wants high protein.",
+             "Create a 7-day high-protein vegetarian meal plan, no eggs."),
+            ("Mujhe ek email likh do apne manager ko ke main kal office nahi aa sakta kyunke meri tabiyat kharab hai",
+             "Manager ko email likh do ke main kal office nahi aa sakta, tabiyat kharab hai"),
+            ("Write an email to my landlord about the broken heater and also ask about the rent increase.",
+             "Email my landlord about the broken heater and ask about the rent increase."),
+            ("I need you to summarize the following article in 3 bullet points and do not add your opinion.",
+             "Summarize the article in 3 bullet points. No opinion."),
+            ("Please explain the difference between TCP and UDP and give one real world example of each.",
+             "Explain TCP vs UDP with one real-world example of each."),
+            ("Translate this paragraph into Spanish and keep the tone formal and polite.",
+             "Translate this paragraph into Spanish, formal and polite tone."),
+        ]
+        for before, after in good:
+            ok, why = M.compression_is_safe(before, after)
+            out.append((f"R2-1 good compression accepted: {before[:45]}..." + ("" if ok else f" ({why})"), ok))
+        bad = [
+            ("Do not use Python, use Rust to write a web server", "Use Python, not Rust, to write a web server"),
+            ("Write a poem about the ocean and also a haiku about mountains and a limerick about cats",
+             "Write a poem about the ocean and a haiku about mountains."),
+            ("Write exactly 5 bullet points about tea, max 500 words", "Write bullet points about tea, max 500 words"),
+            ("مہربانی کر کے میرے باس کو ایک ای میل لکھیں کہ میں کل دفتر نہیں آؤں گا کیونکہ میں بیمار ہوں", "Write a cake recipe"),
+            ("Answer only in French and use formal tone. Explain photosynthesis.", "Explain photosynthesis."),
+        ]
+        for before, after in bad:
+            ok, why = M.compression_is_safe(before, after)
+            out.append((f"R2-1 bad compression rejected: {before[:45]}...", not ok))
+
+        # Round 2, section 4: 'pls pls pls' is handled like other politeness-only prompts
+        out.append(("R2-4 'pls pls pls' alone is removed completely by the rules", optimize("pls pls pls") == ""))
+        _, final = quiet(M.pipeline, "pls pls pls")
+        out.append(("R2-4 ...so the pipeline keeps the original prompt", final == "pls pls pls"))
+
+        # input: two empty lines end typed input; piped input keeps reading
+        out.append(("R2 two empty lines end typed input",
+                    quiet(M.read_prompt, io.StringIO("One.\n\nTwo.\n\n\nignored\n"), True) == "One.\n\nTwo."))
+        out.append(("R2 piped input reads past two empty lines",
+                    M.read_prompt(io.StringIO("One.\n\n\nTwo.\n"), interactive=False) == "One.\n\n\nTwo."))
 
         # D16: curly quotes
         ok, _ = M.compression_is_safe("Please analyze the song “Let It Be” by The Beatles and explain why it became so popular.",

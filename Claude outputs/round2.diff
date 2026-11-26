@@ -1,0 +1,296 @@
+--- /tmp/base2/optimizer.py	2026-11-26 11:42:18.723381464 +0500
++++ optimizer.py	2026-11-26 11:45:20.366566928 +0500
+@@ -40,10 +40,27 @@
+     def at_start(m):
+         if m.group("w").isupper() and m.group("w").lower() != "please":
+             return m.group(0)                      # "PLS" is an acronym
+-        return m.group("lead")
+-    text = re.sub(r"(?P<lead>^|(?<=[.!?,;:])[ \t]+|(?<=\n))(?P<w>please|pls|plz)\b[.!,]?[ \t]*",
++        nxt = m.group("next") or ""
++        # at a sentence start (not after , ; :) the next word now starts the sentence
++        if re.search(r"(^|[.!?\n])[ \t]*$", text[:m.start("w")]):
++            nxt = capitalize_first(nxt)
++        return m.group("lead") + nxt
++    text = re.sub(r"(?P<lead>^|(?<=[.!?,;:])[ \t]+|(?<=\n))(?P<w>please|pls|plz)\b[.!,]?[ \t]*(?P<next>\S+)?",
+                   at_start, text, flags=re.IGNORECASE)
+ 
++    # lowercase "pls" / "plz" in the middle of a sentence is politeness too, except when it's
++    # a name ("the pls tool", "pls command") or an item in a list ("lsp and pls and spl")
++    def mid_sentence(m):
++        before = text[:m.start()].split()[-1:] or [""]
++        after = text[m.end():].split()[:1] or [""]
++        b, a = before[0].lower().strip(",;"), after[0].lower().strip(",;.!?")
++        if b in {"the", "a", "an"} or a in {"tool", "command", "file", "package", "regression", "method"}:
++            return m.group(0)
++        if b in {"and", "or"} and a in {"and", "or"}:
++            return m.group(0)
++        return ""
++    text = re.sub(r"(?<![\w'])(?:pls|plz)\b[ \t]*", mid_sentence, text)
++
+     # right before a request verb: "... and please write a poem"
+     def before_verb(m):
+         return "" if m.group(1).lower() in REQUEST_VERBS else m.group(0)
+@@ -66,7 +83,8 @@
+ # Only these words are collapsed when repeated ("the the", "hello hello").
+ # Other repeats may be intentional ("Bora Bora", "no no no", "knock knock").
+ REPEATABLE = {"the", "a", "an", "is", "to", "of", "in", "on", "and", "or", "for", "it", "i", "be",
+-              "are", "was", "that", "this", "with", "hello", "hi", "hey", "please", "thanks"}
++              "are", "was", "that", "this", "with", "hello", "hi", "hey", "please", "thanks",
++              "pls", "plz", "thx"}
+ 
+ def remove_repeated_words(text):
+     # "hello hello" → "hello",  "the the" → "the"  (lowercase only, so names stay)
+@@ -251,7 +269,14 @@
+              "which", "about", "into", "have", "will", "would", "should", "could", "there",
+              "want", "like", "something", "because", "feeling", "come", "just", "please",
+              "very", "really", "some", "also", "make", "sure", "thank", "thanks", "tell",
+-             "either", "answer", "must", "help", "them", "they", "then", "than", "been"}
++             "either", "answer", "must", "help", "them", "they", "then", "than", "been", "between"}
++
++# words that are never the subject of a rule or request ("avoid USING jargon", "and WANTS protein")
++NOT_SUBJECTS = {"want", "wants", "wanted", "need", "needs", "like", "sound", "seem", "look", "feel",
++                "keep", "try", "eat", "use", "using", "make", "made", "does", "never", "avoid",
++                "without", "nahi", "dont", "don't", "doesn't", "mustn't", "shouldn't"}
++# Roman Urdu function words: they carry no meaning and are often dropped in a good rewrite
++ROMAN_URDU_FUNCTION = {"ek", "apne", "meri", "mera", "kyunke", "ke", "ko", "ka", "ki", "main", "hai", "do"}
+ 
+ NEGATIONS = r"(do not|don't|dont|does not|doesn't|must not|mustn't|should not|shouldn't|never|no|not|avoid|without|nahi|mat|نہیں|نہ|مت)"
+ # generic verbs after a negation; the real rule is in the noun that follows ("do not include EXAMPLES")
+@@ -288,10 +313,26 @@
+     return len(re.findall(rf"(?<![\d.,]){re.escape(num)}(?![.,]?\d)", text))
+ 
+ 
++def _same_word(a, b):
++    """Same word ignoring endings: the first 4 letters match (sort/sorts, dict/dictionaries)."""
++    return a[:4] == b[:4]
++
++
++def _content_words(text, extra_skip=()):
++    """Words in a short window that can be the subject: no stopwords, negations, helper verbs.
++    Words ending in -ing are only used if there's nothing else ("avoid USING jargon" -> jargon)."""
++    words = [w for w in _words(text)
++             if len(w) > 3 and w not in STOPWORDS and w not in GENERIC_VERBS
++             and w not in NOT_SUBJECTS and w not in ROMAN_URDU_FUNCTION and w not in extra_skip
++             and not re.fullmatch(NEGATIONS, w)]
++    plain = [w for w in words if not w.endswith("ing")]
++    return plain or words
++
++
+ def _negated(word, words, window=4):
+     """True if some occurrence of `word` has a negation within the 4 words before it."""
+     for i, w in enumerate(words):
+-        if w.startswith(word[:5]):
++        if _same_word(w, word):
+             if re.search(rf"\b{NEGATIONS}\b", " ".join(words[max(0, i - window):i])):
+                 return True
+     return False
+@@ -321,9 +362,9 @@
+         return lost
+     after_words = _words(after)
+     for m in re.finditer(rf"\b{NEGATIONS}\b((?:\s+[\w']+){{1,4}})", before.lower()):
+-        words = [w for w in _words(m.group(2))
+-                 if len(w) > 3 and w not in STOPWORDS and w not in GENERIC_VERBS]
+-        if words and not _negated(words[0], after_words):   # words[0] = what the rule is about
++        words = _content_words(m.group(2))
++        # kept if at least one subject word survives with a negation right before it
++        if words and not any(_negated(w, after_words) for w in words):
+             lost.append(f"{m.group(1)}{m.group(2)}".strip())
+     return lost
+ 
+@@ -334,24 +375,26 @@
+     lost = []
+     after_words = _words(after)
+     for m in re.finditer(r"\b(and|also|plus)\b((?:\s+[\w']+){1,4})", before.lower()):
+-        words = [w for w in _words(m.group(2))          # skip verbs: "and explain why..." asks nothing new
+-                 if len(w) > 3 and w not in STOPWORDS and w not in GENERIC_VERBS and w not in REQUEST_VERBS]
+-        if words and not any(a.startswith(words[0][:5]) for a in after_words):
++        # skip verbs ("and explain why...") and negations ("and never modifies...")
++        words = _content_words(m.group(2), extra_skip=REQUEST_VERBS)
++        if words and not any(_same_word(a, w) for w in words for a in after_words):
+             lost.append(words[0])
+     return lost
+ 
+ 
+ def keyword_overlap(original, rewritten):
+     """Share of the original's key words still in the rewrite (0.0 to 1.0).
+-    Words are compared by their first 5 letters, so 'lyrics' matches 'lyrical'.
++    Words are compared by their first 4 letters, so 'lyrics' matches 'lyrical' and 'dicts'
++    matches 'dictionaries'. Negations, helper verbs and Roman Urdu function words don't count.
+     Works for any script; Chinese/Japanese/Korean are compared by character pairs."""
+     def keys(t):
+         if script_of(t) == "cjk":
+             chars = [c for c in t if c.isalpha()]
+             return {a + b for a, b in zip(chars, chars[1:])}
+         min_len = 3 if script_of(t) in ("latin", "none") else 1
+-        return {w[:5] for w in _words(t)
+-                if len(w) > min_len and w not in STOPWORDS and w not in GENERIC_VERBS}
++        return {w[:4] for w in _words(t)
++                if len(w) > min_len and w not in STOPWORDS and w not in GENERIC_VERBS
++                and w not in NOT_SUBJECTS and w not in ROMAN_URDU_FUNCTION and not re.fullmatch(NEGATIONS, w)}
+     orig = keys(original)
+     if len(orig) < 4:
+         return 1.0      # too few key words to judge (e.g. short, misspelled prompts)
+@@ -363,8 +406,9 @@
+ def capitalize_first(text):
+     """Capitalize the first letter, but not words like iPhone, npm, e.g., paths or URLs."""
+     first = text.split(None, 1)[0] if text.strip() else ""
+-    if (not first or any(c.isupper() for c in first[1:]) or re.search(r"[./\\:_\-@\d]", first)
+-            or first.lower() in COMMAND_WORDS):
++    core = first.rstrip(".,!?;:")              # "explain." is a word, "e.g." and "x.com" are not
++    if (not core or any(c.isupper() for c in core[1:]) or re.search(r"[./\\:_\-@\d]", core)
++            or core.lower() in COMMAND_WORDS):
+         return text
+     return text[:1].upper() + text[1:]
+ 
+--- /tmp/base2/main.py	2026-11-26 11:42:18.723127422 +0500
++++ main.py	2026-11-26 11:45:20.491320818 +0500
+@@ -174,18 +174,24 @@
+     compare_models(final)
+ 
+ 
+-def read_prompt(stream=None):
+-    """Read the whole prompt, including blank lines between paragraphs.
+-    Stops at a line containing only END, or at end of input (Ctrl+Z then Enter on
+-    Windows, Ctrl+D on Mac/Linux, or the end of piped input)."""
++def read_prompt(stream=None, interactive=None):
++    """Read the whole prompt, including single blank lines between paragraphs.
++    Stops at a line containing only END, at end of input (Ctrl+Z then Enter on Windows,
++    Ctrl+D on Mac/Linux, or the end of piped input), or -- when typing in a terminal --
++    at two empty lines in a row."""
+     stream = stream or sys.stdin
+-    if stream.isatty():
+-        print("Paste your prompt. When you're done, type END on its own line and press Enter.")
++    if interactive is None:
++        interactive = stream.isatty()
++    if interactive:
++        print("Paste your prompt. When you're done, press Enter on two empty lines (or type END).")
+     lines = []
+     for line in stream:
++        line = line.rstrip("\r\n")
+         if line.strip() == "END":
+             break
+-        lines.append(line.rstrip("\r\n"))
++        if interactive and line == "" and lines and lines[-1] == "":
++            break                                   # second empty line in a row
++        lines.append(line)
+     return "\n".join(lines).strip()
+ 
+ 
+--- /tmp/base2/tests.py	2026-11-26 11:42:18.723414082 +0500
++++ tests.py	2026-11-26 11:45:07.073255134 +0500
+@@ -199,6 +199,46 @@
+     ('C14 ellipsis kept',
+      'Explain the ellipsis... and what comes next...',
+      [], [], 'Explain the ellipsis... and what comes next...'),
++    # ---- round 2 regression tests ----
++    ("R2-2 capitalize after removed 'pls' at sentence start",
++     "he said 'hi' and then left. pls summarize",
++     [], [], "he said 'hi' and then left. Summarize"),
++    ("R2-2 capitalize after removed 'please also'",
++     'write it in python. please also add comments',
++     [], [], 'write it in python. Also add comments'),
++    ('R2-2 capitalize after possessive apostrophes',
++     "It's the students' books and the teachers' pens. please explain",
++     [], [], "It's the students' books and the teachers' pens. Explain"),
++    ('R2-2 capitalize after an unbalanced quote',
++     'Unbalanced quote: "hello world. Please explain.',
++     [], [], 'Unbalanced quote: "hello world. Explain.'),
++    ('R2-2 no capital after a comma',
++     'Done, please explain',
++     [], [], 'Done, explain'),
++    ('R2-2 npm stays lowercase after removed please',
++     'Fix this. please npm install it',
++     [], [], 'Fix this. npm install it'),
++    ('R2-2 iPhone unchanged after removed please',
++     'Use iPhone. please iPhone tips',
++     [], [], 'Use iPhone. iPhone tips'),
++    ("R2-3 mid-sentence 'pls' removed",
++     'krta hun pls plslplsplsplsplpsl leik do na ???????_))(__)()(_(',
++     [], [], 'krta hun leik do na?'),
++    ("R2-3 'the pls tool' kept",
++     'Explain LSP (language server protocol) and the pls tool',
++     [], [], 'Explain LSP (language server protocol) and the pls tool'),
++    ("R2-3 'pls command' kept",
++     'Run the pls command',
++     [], [], 'Run the pls command'),
++    ("R2-3 mid-sentence 'plz' removed",
++     'can you plz write a poem',
++     [], [], 'can you write a poem'),
++    ("R2-4 repeated 'pls' fully collapsed before a request",
++     'pls pls pls write a poem',
++     [], [], 'Write a poem'),
++    ("R2-4 repeated 'thx' collapsed, then removed as closing thanks",
++     'Write a poem. thx thx thx',
++     [], [], 'Write a poem.'),
+ ]
+ 
+ # Known problems we'll fix later: shown as warnings, not failures
+@@ -257,6 +297,14 @@
+     ("A6 flipped negation (Python/Rust) is caught",
+      "Do not use Python, use Rust to write a web server",
+      "Use Python, not Rust, to write a web server", True),
++    ("R2-1 '10' kept as '10-year-old'",
++     "Explain it to a 10 year old child.", "Explain it to a 10-year-old.", False),
++    ("R2-1 '7' kept as '7-day', '16' as '16GB'",
++     "Create a 7 day plan for a 16 GB laptop", "Create a 7-day plan for a 16GB laptop", False),
++    ("R2-1 'avoid USING jargon': jargon is the subject",
++     "Avoid using jargon or technical terms.", "Avoid jargon and technical terms.", False),
++    ("R2-1 'never modifies' kept as 'without modifying'",
++     "Sort the list and never modifies the original list.", "Sort the list without modifying the original list.", False),
+     ("Roman Urdu negation kept",
+      "main kal office nahi aa sakta", "main kal office nahi aa sakta", False),
+ ]
+@@ -368,6 +416,53 @@
+                                       "写一个蛋糕食谱")
+         out.append(("A7 Chinese with unrelated rewrite is rejected", not ok))
+ 
++        # Round 2, section 1: good compressions must be accepted, bad ones rejected
++        good = [
++            ("Avoid using jargon or technical terms. Explain how vaccines work to a 10 year old child.",
++             "Explain how vaccines work to a 10-year-old. Avoid jargon and technical terms."),
++            ("Could you write a cover letter for a software engineer role and make it sound confident but not arrogant?",
++             "Write a confident, not arrogant, cover letter for a software engineer role."),
++            ("Write a Python function that sorts a list of dictionaries by the age key and never modifies the original list.",
++             "Write a Python function to sort a list of dicts by age without modifying the original list."),
++            ("Create a 7 day meal plan for a vegetarian who does not eat eggs and wants high protein.",
++             "Create a 7-day high-protein vegetarian meal plan, no eggs."),
++            ("Mujhe ek email likh do apne manager ko ke main kal office nahi aa sakta kyunke meri tabiyat kharab hai",
++             "Manager ko email likh do ke main kal office nahi aa sakta, tabiyat kharab hai"),
++            ("Write an email to my landlord about the broken heater and also ask about the rent increase.",
++             "Email my landlord about the broken heater and ask about the rent increase."),
++            ("I need you to summarize the following article in 3 bullet points and do not add your opinion.",
++             "Summarize the article in 3 bullet points. No opinion."),
++            ("Please explain the difference between TCP and UDP and give one real world example of each.",
++             "Explain TCP vs UDP with one real-world example of each."),
++            ("Translate this paragraph into Spanish and keep the tone formal and polite.",
++             "Translate this paragraph into Spanish, formal and polite tone."),
++        ]
++        for before, after in good:
++            ok, why = M.compression_is_safe(before, after)
++            out.append((f"R2-1 good compression accepted: {before[:45]}..." + ("" if ok else f" ({why})"), ok))
++        bad = [
++            ("Do not use Python, use Rust to write a web server", "Use Python, not Rust, to write a web server"),
++            ("Write a poem about the ocean and also a haiku about mountains and a limerick about cats",
++             "Write a poem about the ocean and a haiku about mountains."),
++            ("Write exactly 5 bullet points about tea, max 500 words", "Write bullet points about tea, max 500 words"),
++            ("مہربانی کر کے میرے باس کو ایک ای میل لکھیں کہ میں کل دفتر نہیں آؤں گا کیونکہ میں بیمار ہوں", "Write a cake recipe"),
++            ("Answer only in French and use formal tone. Explain photosynthesis.", "Explain photosynthesis."),
++        ]
++        for before, after in bad:
++            ok, why = M.compression_is_safe(before, after)
++            out.append((f"R2-1 bad compression rejected: {before[:45]}...", not ok))
++
++        # Round 2, section 4: 'pls pls pls' is handled like other politeness-only prompts
++        out.append(("R2-4 'pls pls pls' alone is removed completely by the rules", optimize("pls pls pls") == ""))
++        _, final = quiet(M.pipeline, "pls pls pls")
++        out.append(("R2-4 ...so the pipeline keeps the original prompt", final == "pls pls pls"))
++
++        # input: two empty lines end typed input; piped input keeps reading
++        out.append(("R2 two empty lines end typed input",
++                    quiet(M.read_prompt, io.StringIO("One.\n\nTwo.\n\n\nignored\n"), True) == "One.\n\nTwo."))
++        out.append(("R2 piped input reads past two empty lines",
++                    M.read_prompt(io.StringIO("One.\n\n\nTwo.\n"), interactive=False) == "One.\n\n\nTwo."))
++
+         # D16: curly quotes
+         ok, _ = M.compression_is_safe("Please analyze the song “Let It Be” by The Beatles and explain why it became so popular.",
+                                       'Analyze the song "Let It Be" by The Beatles and explain why it became popular.')

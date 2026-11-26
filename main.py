@@ -174,18 +174,24 @@ def report(prompt, final):
     compare_models(final)
 
 
-def read_prompt(stream=None):
-    """Read the whole prompt, including blank lines between paragraphs.
-    Stops at a line containing only END, or at end of input (Ctrl+Z then Enter on
-    Windows, Ctrl+D on Mac/Linux, or the end of piped input)."""
+def read_prompt(stream=None, interactive=None):
+    """Read the whole prompt, including single blank lines between paragraphs.
+    Stops at a line containing only END, at end of input (Ctrl+Z then Enter on Windows,
+    Ctrl+D on Mac/Linux, or the end of piped input), or -- when typing in a terminal --
+    at two empty lines in a row."""
     stream = stream or sys.stdin
-    if stream.isatty():
-        print("Paste your prompt. When you're done, type END on its own line and press Enter.")
+    if interactive is None:
+        interactive = stream.isatty()
+    if interactive:
+        print("Paste your prompt. When you're done, press Enter on two empty lines (or type END).")
     lines = []
     for line in stream:
+        line = line.rstrip("\r\n")
         if line.strip() == "END":
             break
-        lines.append(line.rstrip("\r\n"))
+        if interactive and line == "" and lines and lines[-1] == "":
+            break                                   # second empty line in a row
+        lines.append(line)
     return "\n".join(lines).strip()
 
 
