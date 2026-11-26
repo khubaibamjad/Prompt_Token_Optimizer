@@ -303,7 +303,9 @@ STOPWORDS = {"the", "and", "that", "this", "with", "for", "from", "your", "what"
              "either", "answer", "must", "help", "them", "they", "then", "than", "been", "between",
              # greetings and small talk carry no meaning for the task
              "hello", "helo", "hallo", "doing", "today", "well", "dude", "friend", "dost", "bhai",
-             "yaar", "jaan", "baby", "babe", "dear"}
+             "yaar", "jaan", "baby", "babe", "dear",
+             # generic verbs a terse rewrite often swaps ("figure out" -> "design", "implement" -> "")
+             "might", "implement", "figure", "able", "allow", "allowed", "going"}
 
 # words that are never the subject of a rule or request ("avoid USING jargon", "and WANTS protein")
 NOT_SUBJECTS = {"want", "wants", "wanted", "need", "needs", "like", "sound", "seem", "look", "feel",
@@ -445,6 +447,33 @@ def lost_constraints(before, after, check_subjects=True):
         if words and not any(_negated(w, after_words, allow_only=allow_only) for w in words):
             lost.append(f"{m.group(1)}{m.group(2)}".strip())
     return lost
+
+
+def added_constraints(before, after):
+    """Negative rules in `after` that `before` never had: "Before coding, plan..." -> "No code." """
+    added = []
+    before_words = _words(before)
+    for m in re.finditer(rf"\b{NEGATIONS}\b((?:\s+[\w']+){{1,4}})", after.lower()):
+        words = _content_words(m.group(2))
+        # "only" in the original also counts ("see only their own" -> "not other sellers'")
+        if words and not any(_negated(w, before_words, allow_only=True) for w in words):
+            added.append(f"{m.group(1)}{m.group(2)}".strip())
+    return added
+
+
+# order of steps and plans: "first X, then Y", "simulate payments for now, integrate later"
+SEQUENCE_GROUPS = {
+    "first/before": r"\b(first|before|beforehand|initially|to start|start by|start with)\b",
+    "for now": r"\b(for now|currently|at the moment|right now|to begin with|at first)\b",
+    "later": r"\b(later|future|eventually|afterwards|down the line|next phase|in a later)\b",
+    "then/after": r"\b(then|after|once)\b",
+}
+
+def lost_sequence(before, after):
+    """Order-of-steps and plan words that disappeared ("first", "for now", "later")."""
+    return [name for name, pattern in SEQUENCE_GROUPS.items()
+            if re.search(pattern, before, re.IGNORECASE) and not re.search(pattern, after, re.IGNORECASE)
+            and name != "then/after"]       # "then/after" is often implied by "first"; too strict to require
 
 
 def lost_requests(before, after):

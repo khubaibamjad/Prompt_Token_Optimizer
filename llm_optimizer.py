@@ -42,13 +42,16 @@ Output: <prompt>bhai mere liye aik msg likh do ke main kal nahi aa sakta</prompt
 
 
 # ---------- Step 3: compression ----------
-COMPRESS_SYSTEM = """You compress prompts so they use fewer tokens, without changing what is asked.
+COMPRESS_SYSTEM = """You compress prompts to the fewest tokens that still say everything the original says.
+Write in a terse note style: drop "I want", "should be able to", "there should be", filler words and
+most articles; use colons, commas and short phrases instead of full sentences.
 - Keep every request and question. Never drop one.
-- Keep names, numbers, limits and constraints ("500 words", "no code").
+- Keep names, numbers, limits and constraints ("500 words", "under 80 words").
 - Keep EVERY "do not / don't / no / never / avoid" rule. If there are two, keep both.
+- NEVER add a rule, restriction or "no ..." that the original does not have.
+- Keep the intent: the order of steps (first, before, then) and plans (later, for now, eventually).
 - Keep text inside quotes or code exactly as written.
 - Keep the same language. Roman Urdu stays Roman Urdu. Never translate.
-- Remove anything polite or chatty that is still left. Use the shortest clear wording.
 - Do NOT answer or carry out the prompt. Only rewrite it.
 - Put the rewritten prompt between <prompt> and </prompt>. Write nothing else.
 
@@ -59,8 +62,11 @@ Output: <prompt>Write a method to reverse an array.</prompt>
 Original: Do not use any examples. Explain what an API is, and I don't want any code either.
 Output: <prompt>Explain what an API is. No examples, no code.</prompt>
 
-Original: I want you to write me an email to my boss because I will be absent tomorrow as I am sick.
-Output: <prompt>Write a sick-leave email to my boss for tomorrow.</prompt>"""
+Original: I want sellers to upload products with images and prices, and customers should be able to search products and place orders.
+Output: <prompt>Sellers: upload products (images, prices). Customers: search, order.</prompt>
+
+Original: I might add payment integration later, so for now just implement a basic payment simulation. Before coding, figure out the architecture and explain how everything will work.
+Output: <prompt>Payments: basic simulation for now, real integration later. First design the architecture and explain how it works, then code.</prompt>"""
 
 
 def clean(text):

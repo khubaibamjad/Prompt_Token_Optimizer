@@ -661,6 +661,45 @@ def safety_checks():
         out.append(("R6 prompts with code blocks are not chunked", "chunks separately" not in log.getvalue()))
         L.CACHE.clear()
 
+        # Round 7: keep the motive -- no invented rules, keep order and plans
+        from optimizer import added_constraints, lost_sequence
+        plan = ("I might add payment integration later, so for now just implement a basic payment simulation. "
+                "Before coding, figure out the architecture and explain how everything will work.")
+        out.append(("R7 an invented 'No code.' rule is caught",
+                    added_constraints(plan, "Basic payment simulation. No code. Explain the architecture.") != []))
+        out.append(("R7 rules that were in the original aren't 'invented'",
+                    added_constraints("Do not include examples. I don't want any code.", "No examples, no code.") == []))
+        out.append(("R7 lost 'later' / 'for now' / 'before' is caught",
+                    set(lost_sequence(plan, "Basic payment simulation. Explain the architecture.")) >= {"later", "for now", "first/before"}))
+        out.append(("R7 'first ... then' keeps the order",
+                    lost_sequence(plan, "Payments: simulation for now, real integration later. First design the architecture, then code.") == []))
+        ok, why = M.compression_is_safe(plan, "Basic payment simulation. No code. Explain the architecture and how it works.")
+        out.append(("R7 rewrite with an invented rule is rejected", not ok))
+        ok, why = M.compression_is_safe(plan, "Payments: basic simulation for now, real integration later. "
+                                              "First design the architecture and explain how it works, then code.")
+        out.append(("R7 terse rewrite that keeps the motive is accepted" + ("" if ok else f" ({why})"), ok))
+
+        class InventsThenFixes:
+            """First try invents 'No code.'; the retry (told to remove it) keeps the plan instead."""
+            def __init__(self):
+                self.notes = []
+            def chat(self, model, messages, **kwargs):
+                user = messages[1]["content"]
+                self.notes.append(user)
+                if "rejected because" in user:
+                    text = "Payments: simulation for now, real integration later. First design the architecture and explain it, then code."
+                else:
+                    text = "Basic payment simulation. No code. Explain the architecture."
+                return FakeResponse(f"<prompt>{text}</prompt>")
+        L.client = InventsThenFixes()
+        M.USE_AI = True
+        _, final = quiet(M.pipeline, plan)
+        M.USE_AI = False
+        out.append(("R7 retry is told to remove the invented rule",
+                    len(L.client.notes) == 2 and "added rules" in L.client.notes[1]))
+        out.append(("R7 the fixed, shorter rewrite is used", "No code" not in final and "later" in final and len(final) < len(plan)))
+        L.CACHE.clear()
+
         # D16: curly quotes
         ok, _ = M.compression_is_safe("Please analyze the song “Let It Be” by The Beatles and explain why it became so popular.",
                                       'Analyze the song "Let It Be" by The Beatles and explain why it became popular.')

@@ -2,7 +2,8 @@ import re
 import sys
 from token_counter import count_tokens, compare_models
 from optimizer import (optimize, pre_clean, protected_parts, keyword_overlap, lost_constraints,
-                       lost_requests, normalize_quotes, script_of, sentences_with, split_chunks)
+                       lost_requests, normalize_quotes, script_of, sentences_with, split_chunks,
+                       added_constraints, lost_sequence)
 import llm_optimizer
 from llm_optimizer import (spell_fix, llm_optimize, needs_spell_fix, MAX_AI_TOKENS, MODEL, SPELL_MODEL,
                            remember_spell, forget_spell, remember_compression, forget_compression)
@@ -17,6 +18,8 @@ CHUNK_SIZE = 60         # tokens per chunk
 # a few sentences have few key words, so a good paraphrase ("platform" -> "marketplace") changes a
 # big share of them; chunks still get every other check (rules, numbers, requests, quotes, language)
 CHUNK_MIN_OVERLAP = 0.5
+# whole prompts need 60% of key words: terse rewrites swap many words, and every rule, number,
+# request, invented rule and step order is checked separately anyway
 
 # common Roman Urdu words; if the input has them and the output doesn't, it was translated
 ROMAN_URDU = {"hai", "ho", "mujhe", "karo", "likh", "likho", "nahi", "bhai", "ka", "ki", "ke",
@@ -103,7 +106,7 @@ def spelling_is_safe(original, fixed):
     return True, ""
 
 
-def compression_is_safe(before, after, min_overlap=0.7):
+def compression_is_safe(before, after, min_overlap=0.6):
     """A compressed prompt must keep quoted text, rules, numbers, every request,
     the same language, most key words, and be shorter."""
     if not after.strip():
@@ -117,6 +120,12 @@ def compression_is_safe(before, after, min_overlap=0.7):
     dropped = lost_requests(before, after)
     if dropped:
         return False, f"dropped requests: {dropped}"
+    added = added_constraints(before, after)
+    if added:
+        return False, f"added rules the original doesn't have: {added}"
+    order = lost_sequence(before, after)
+    if order:
+        return False, f"lost the order or plan ({', '.join(order)})"
     why = changed_language(before, after)
     if why:
         return False, why
@@ -184,7 +193,7 @@ def pipeline(prompt):
             final = compress(rules_version, "3 AI") or rules_version
     return rules_version, final
 
-def compress(text, label, verbose=True, min_overlap=0.7):
+def compress(text, label, verbose=True, min_overlap=0.6):
     """Shorten `text` with the AI: one try, plus one retry told what was missing.
     Returns the safe shorter version, or None if both tries were rejected."""
     feedback = ""
@@ -207,11 +216,17 @@ def compress(text, label, verbose=True, min_overlap=0.7):
         if verbose:
             print(f"  [{name:<11}] rejected: {why} -> {short[:300]}")
         # only retry when the model left something out; other problems won't improve
-        if not why.startswith(("dropped requests", "lost rules or numbers", "kept only")):
+        if not why.startswith(("dropped requests", "lost rules or numbers", "kept only",
+                               "added rules", "lost the order")):
             return None
         missing = lost_constraints(text, short) + lost_requests(text, short)
         keep = sentences_with(text, missing)
         feedback = why.replace("dropped requests:", "dropped these requests:")
+        if why.startswith("added rules"):
+            feedback += ". Remove those; only say what the original says"
+        if why.startswith("lost the order"):
+            keep = keep or [s for s in re.split(r"(?<=[.!?])\s+", text)
+                            if re.search(r"\b(first|before|later|for now|currently|eventually|future|initially)\b", s, re.I)]
         if keep:
             # say clearly that the WHOLE original must be compressed again (not just these sentences)
             feedback += (". Compress the whole original again. Your new version must still include the meaning of: "
