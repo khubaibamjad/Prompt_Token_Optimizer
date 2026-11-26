@@ -2,6 +2,7 @@ import re
 import sys
 import time
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from token_counter import count_tokens, compare_models
 from optimizer import (optimize, pre_clean, protected_parts, keyword_overlap, lost_constraints,
@@ -21,6 +22,12 @@ CHUNK_SIZE = 60         # tokens per chunk
 # a few sentences have few key words, so a good paraphrase ("platform" -> "marketplace") changes a
 # big share of them; chunks still get every other check (rules, numbers, requests, quotes, language)
 CHUNK_MIN_OVERLAP = 0.5
+# big prompts (documents, specs) run in a faster mode: bigger chunks, tiny pieces skipped,
+# no retries, and several chunks sent to Ollama at the same time
+BIG_PROMPT = 600            # tokens
+BIG_CHUNK_SIZE = 120        # tokens per chunk in big prompts
+BIG_MIN_CHUNK = 20          # smaller pieces in big prompts only get the rule cleanup
+PARALLEL = 3                # chunks sent to Ollama at once
 SPELL_CHUNK_SIZE = 120  # tokens per chunk for the spell step (it only fixes typos, so bigger is fine)
 # a single AI call never gets more than MAX_AI_TOKENS (bigger prompts are chunked);
 # only truly huge prompts skip the AI altogether
@@ -182,7 +189,7 @@ def pipeline(prompt):
             final = compress(rules_version, "3 AI") or rules_version
     return rules_version, final
 
-def compress(text, label, verbose=True, min_overlap=0.6):
+def compress(text, label, verbose=True, min_overlap=0.6, retry=True):
     """Shorten `text` with the AI: one try, plus one retry told what was missing.
     Returns the safe shorter version, or None if both tries were rejected."""
     feedback = ""
@@ -205,8 +212,8 @@ def compress(text, label, verbose=True, min_overlap=0.6):
         if verbose:
             print(f"  [{name:<11}] rejected: {why} -> {short[:300]}")
         # only retry when the model left something out; other problems won't improve
-        if not why.startswith(("dropped requests", "lost rules or numbers", "kept only",
-                               "added rules", "lost the order")):
+        if not retry or not why.startswith(("dropped requests", "lost rules or numbers", "kept only",
+                                            "added rules", "lost the order")):
             return None
         missing = lost_constraints(text, short) + lost_requests(text, short)
         keep = sentences_with(text, missing)
@@ -226,29 +233,41 @@ def compress(text, label, verbose=True, min_overlap=0.6):
 def compress_in_chunks(text):
     """Shorten a long prompt a few sentences at a time. Headings, tables and code blocks are
     kept as they are, list markers ("- ", "1. ") stay in place, and chunks the AI can't shorten
-    safely stay exactly as written -- so one mistake never costs the whole saving."""
-    chunks = split_chunks(text, CHUNK_SIZE)
+    safely stay exactly as written -- so one mistake never costs the whole saving.
+    Big prompts use fast mode: bigger chunks, tiny pieces skipped, no retries, parallel requests."""
+    big = count_tokens(text) >= BIG_PROMPT
+    size, min_tokens = (BIG_CHUNK_SIZE, BIG_MIN_CHUNK) if big else (CHUNK_SIZE, 8)
+    chunks = split_chunks(text, size)
     work = [i for i, (chunk, _) in enumerate(chunks)
-            if count_tokens(chunk) > 8 and not STRUCTURE_LINE.match(chunk)
+            if count_tokens(chunk) > min_tokens and not STRUCTURE_LINE.match(chunk)
             and count_tokens(chunk) <= MAX_AI_TOKENS]
-    print(f"  [3 AI       ] long prompt: shortening {len(work)} of {len(chunks)} chunks separately")
+    mode = f", fast mode, {PARALLEL} at a time" if big else ""
+    print(f"  [3 AI       ] long prompt: shortening {len(work)} of {len(chunks)} chunks separately{mode}")
     out = [chunk + gap for chunk, gap in chunks]
     start = time.perf_counter()
-    for n, i in enumerate(work, 1):
+
+    def shorten(i):
         chunk, gap = chunks[i]
         prefix = LIST_PREFIX.match(chunk)
         prefix = prefix.group(0) if prefix else ""
-        body = chunk[len(prefix):]
-        label = f"3 AI {n}/{len(work)}"
-        short = compress(body, label, verbose=False, min_overlap=CHUNK_MIN_OVERLAP)
-        elapsed = time.perf_counter() - start
-        eta = elapsed / n * (len(work) - n)
-        timing = f"  ({elapsed:.0f}s, ~{eta:.0f}s left)" if len(work) > 3 else ""
-        if short:
-            print(f"  [{label:<11}] {count_tokens(chunk):>3} → {count_tokens(prefix + short):>3} tokens ✅{timing}")
-            out[i] = prefix + short + gap
-        else:
-            print(f"  [{label:<11}] {count_tokens(chunk):>3} tokens, kept as is (no safe shorter version){timing}")
+        short = compress(chunk[len(prefix):], "3 AI", verbose=False,
+                         min_overlap=CHUNK_MIN_OVERLAP, retry=not big)
+        return i, chunk, gap, prefix, short
+
+    workers = PARALLEL if big else 1
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(shorten, i) for i in work]
+        for n, future in enumerate(as_completed(futures), 1):
+            i, chunk, gap, prefix, short = future.result()
+            elapsed = time.perf_counter() - start
+            eta = elapsed / n * (len(work) - n)
+            timing = f"  ({elapsed:.0f}s, ~{eta:.0f}s left)" if len(work) > 3 else ""
+            label = f"3 AI {n}/{len(work)}"
+            if short:
+                print(f"  [{label:<11}] {count_tokens(chunk):>3} → {count_tokens(prefix + short):>3} tokens ✅{timing}")
+                out[i] = prefix + short + gap
+            else:
+                print(f"  [{label:<11}] {count_tokens(chunk):>3} tokens, kept as is (no safe shorter version){timing}")
     joined = "".join(out).strip()
     # final check on the whole result (numbers, quotes, language, rules across chunks)
     ok, why = compression_is_safe(text, joined, CHUNK_MIN_OVERLAP)
@@ -396,7 +415,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Optimize a prompt to use fewer tokens.")
     parser.add_argument("--file", "-f", help="read the prompt from this text file")
     parser.add_argument("--out", "-o", help="where to save the result (default: <file>.optimized.txt)")
+    parser.add_argument("--no-ai", action="store_true", help="rules only: instant, no Ollama needed")
     args = parser.parse_args()
+    if args.no_ai:
+        USE_AI = False
     try:
         if args.file:
             optimize_file(args.file, args.out)

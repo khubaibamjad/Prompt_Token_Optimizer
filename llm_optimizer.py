@@ -2,6 +2,7 @@ import re
 import json
 import time
 import hashlib
+import threading
 from pathlib import Path
 import ollama
 from token_counter import count_tokens
@@ -106,8 +107,11 @@ def cache_key(model, system, prompt):
     # the instructions are part of the key, so changing them never returns stale answers
     return hashlib.sha256(f"{model}|{system}|{prompt}".encode("utf-8")).hexdigest()
 
+_CACHE_LOCK = threading.Lock()      # chunks may be processed in parallel
+
 def save_cache():
-    CACHE_FILE.write_text(json.dumps(CACHE, ensure_ascii=False, indent=1), encoding="utf-8")
+    with _CACHE_LOCK:
+        CACHE_FILE.write_text(json.dumps(CACHE, ensure_ascii=False, indent=1), encoding="utf-8")
 
 
 def remember(system, model, prompt, reply):
@@ -185,7 +189,9 @@ TECH_WORDS = ["json", "api", "apis", "gpt", "llm", "ai", "tiktoken", "ollama", "
               "webhook", "webhooks", "schema", "env", "npm", "pip", "cli", "ui", "ux", "sdk", "oauth",
               "crud", "orm", "graphql", "redis", "nginx", "linux", "ci", "cd", "codebase", "refactor",
               "refactoring", "scalable", "maintainable", "responsive", "frontends", "backends",
-              "admin", "admins", "dashboard", "ecommerce", "checkout", "signin", "username", "usernames"]
+              "admin", "admins", "dashboard", "ecommerce", "checkout", "signin", "username", "usernames",
+              "auth", "db", "utils", "util", "params", "args", "async", "boolean", "enum", "enums", "json",
+              "endpoint", "endpoints", "timestamp", "timestamps", "metadata", "plugin", "plugins", "toolbar"]
 
 try:
     from spellchecker import SpellChecker

@@ -794,6 +794,36 @@ def safety_checks():
                         and open(result, encoding="utf-8").read().strip() == "Write a poem about the sea."))
         L.CACHE.clear()
 
+        # Round 10: fast mode for big prompts
+        class AlwaysDrops:
+            """Every rewrite drops the rules, so every chunk is rejected."""
+            def __init__(self):
+                self.calls = 0
+                self.lock = __import__("threading").Lock()
+            def chat(self, model, messages, **kwargs):
+                if messages[0]["content"].startswith("You fix spelling"):     # spelling: change nothing
+                    text = messages[1]["content"].split("Original: ", 1)[1].rsplit("\nOutput:", 1)[0]
+                    return FakeResponse(f"<prompt>{text}</prompt>")
+                with self.lock:
+                    self.calls += 1                                           # count compression calls only
+                return FakeResponse("<prompt>Short.</prompt>")
+        para = ("Sellers should be able to upload {n} products with images, prices and stock in every category we support. "
+                "Do not use paid services for the {n} module, and keep the {n} code simple and well commented for new developers. ")
+        huge = "\n\n".join(para.format(n=f"{name} part {k}") for name in ["auth", "orders", "search", "payments",
+                                                                         "admin", "reviews"] for k in (1, 2, 3))
+        L.client = AlwaysDrops()
+        M.USE_AI = True
+        log = io.StringIO()
+        with redirect_stdout(log):
+            _, final = M.pipeline(huge)
+        M.USE_AI = False
+        n_chunks = int(re.search(r"shortening (\d+) of", log.getvalue()).group(1))
+        out.append(("R10 big prompts use fast mode", "fast mode" in log.getvalue()))
+        out.append(("R10 fast mode: one call per chunk, no retries", L.client.calls == n_chunks))
+        out.append(("R10 rejected chunks in fast mode stay exactly as written",
+                    final.count("Do not use paid services") == huge.count("Do not use paid services")))
+        L.CACHE.clear()
+
         # D16: curly quotes
         ok, _ = M.compression_is_safe("Please analyze the song “Let It Be” by The Beatles and explain why it became so popular.",
                                       'Analyze the song "Let It Be" by The Beatles and explain why it became popular.')
