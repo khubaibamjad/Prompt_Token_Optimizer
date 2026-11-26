@@ -284,6 +284,16 @@ RULE_TESTS = [
     ("R5 'obviously' removed",
      'Make it simple, obviously not like Amazon.',
      [], [], 'Make it simple, not like Amazon.'),
+    # ---- round 9 regression tests ----
+    ('R9 filler at a sentence start leaves a capital',
+     'Intro. I want you to make sure that the module works. It is important to note that the module must not leak data.',
+     [], [], 'Intro. Ensure the module works. The module must not leak data.'),
+    ("R9 'without any problems' is filler",
+     'Users should use it on mobile without any problems.',
+     [], [], 'Users should use it on mobile.'),
+    ('R9 filler mid-sentence stays lowercase',
+     'We need it, basically for testing.',
+     [], [], 'We need it, for testing.'),
 ]
 
 # Known problems we'll fix later: shown as warnings, not failures
@@ -359,6 +369,8 @@ CONSTRAINT_TESTS = [
     ("R5 'without rewriting' kept",
      "Design it so features can be added without rewriting everything.",
      "Design it so features can be added without rewriting.", False),
+    ("R8 opposite meaning with the same prefix is caught",
+     "Don't overcomplicate it.", "Avoid oversimplification.", True),
     ("Roman Urdu negation kept",
      "main kal office nahi aa sakta", "main kal office nahi aa sakta", False),
 ]
@@ -698,6 +710,88 @@ def safety_checks():
         out.append(("R7 retry is told to remove the invented rule",
                     len(L.client.notes) == 2 and "added rules" in L.client.notes[1]))
         out.append(("R7 the fixed, shorter rewrite is used", "No code" not in final and "later" in final and len(final) < len(plan)))
+        L.CACHE.clear()
+
+        # Round 8: word matching and verb-only requests
+        from optimizer import _same_word, lost_requests
+        out.append(("R8 'overcomplicate' is not the same word as 'oversimplification'",
+                    not _same_word("overcomplicate", "oversimplification")))
+        out.append(("R8 word endings still match (orders/order, modifies/modifying, dicts/dictionaries, coding/code)",
+                    all(_same_word(a, b) for a, b in [("orders", "order"), ("modifies", "modifying"),
+                                                      ("dicts", "dictionaries"), ("coding", "code")])))
+        out.append(("R8 dropped 'and explain how everything will work' is caught",
+                    lost_requests("Plan the architecture and explain how everything will work.",
+                                  "Design the architecture.") == ["explain"]))
+        out.append(("R8 helper verbs (do/give) aren't treated as requests",
+                    lost_requests("Summarize it and do not add your opinion. Compare TCP and UDP and give one example.",
+                                  "Summarize it, no opinion. Compare TCP vs UDP with one example.") == []))
+        ok, _ = M.compression_is_safe("Plan the architecture and explain how everything will work. Don't overcomplicate it, but don't make it too basic either.",
+                                      "Design architecture: avoid oversimplification, avoid basic.")
+        out.append(("R8 'avoid oversimplification' for 'don't overcomplicate' is rejected", not ok))
+
+        # Round 9: big prompts
+        doc = ("# Project brief\n\nI want you to build a shop. Sellers should be able to upload products. "
+               "Customers should be able to search.\n\n## Rules\n- Do not use any paid services.\n"
+               "- Keep the code simple and well commented.\n\n```python\ndef hello():\n    print(\"Hello. World.\")\n```\n\n"
+               "Finally, explain the architecture first.")
+        parts = split_chunks(doc, 20)
+        out.append(("R9 chunks join back to the exact markdown text", "".join(c + g for c, g in parts) == doc))
+        out.append(("R9 headings, list items and code blocks are their own chunks",
+                    "## Rules" in [c for c, g in parts] and "- Do not use any paid services." in [c for c, g in parts]
+                    and any(c.startswith("```python") and c.endswith("```") for c, g in parts)))
+
+        class BigDocModel:
+            def __init__(self):
+                self.spell_calls = 0
+                self.compress_calls = 0
+            def chat(self, model, messages, **kwargs):
+                text = messages[1]["content"].split("Original: ", 1)[1].rsplit("\nOutput:", 1)[0].split("\nYour previous")[0]
+                if messages[0]["content"].startswith("You fix spelling"):
+                    self.spell_calls += 1
+                    text = text.replace("pannel", "panel").replace("shuld", "should")
+                else:
+                    self.compress_calls += 1
+                    text = text.replace("should be able to ", "can ").replace(" and well commented", ", commented")
+                return FakeResponse(f"<prompt>{text}</prompt>")
+        section = ("## Section {n}\n\nSellers should be able to upload products with images and prices in section {n}. "
+                   "Customers should be able to search products and place orders in section {n}.\n"
+                   "- Do not use any paid services in section {n}.\n- Keep the code simple and well commented.\n\n")
+        big = "# Spec\n\n" + "".join(section.format(n=n) for n in range(1, 9)) + \
+              "```python\nprint('keep me')\n```\n\nThe admin pannel shuld manage users and orders."
+        L.client = BigDocModel()
+        M.USE_AI = True
+        log = io.StringIO()
+        with redirect_stdout(log):
+            _, final = M.pipeline(big)
+        M.USE_AI = False
+        out.append(("R9 big prompt is shortened in chunks", "chunks separately" in log.getvalue()
+                    and count_tokens(final) < count_tokens(big)))
+        out.append(("R9 only the chunk with typos goes to the spell model", L.client.spell_calls == 1
+                    and "admin panel should" in final))
+        out.append(("R9 headings and the code block are unchanged",
+                    "## Section 5" in final and "```python\nprint('keep me')\n```" in final))
+        out.append(("R9 list markers and every 'do not' rule are kept",
+                    final.count("\n- Do not use any paid services") == 8))
+        out.append(("R9 list items are shortened behind their marker", "- Keep the code simple, commented." in final))
+
+        L.client = BigDocModel()
+        saved_limit = M.MAX_PROMPT_TOKENS
+        M.MAX_PROMPT_TOKENS = 100
+        M.USE_AI = True
+        quiet(M.pipeline, big)
+        M.USE_AI = False
+        M.MAX_PROMPT_TOKENS = saved_limit
+        out.append(("R9 prompts over MAX_PROMPT_TOKENS skip the AI", L.client.spell_calls + L.client.compress_calls == 0))
+
+        import tempfile, os
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "spec.txt")
+            with open(src, "w", encoding="utf-8") as f:
+                f.write("Hello, I want you to write a poem about the sea. Thank you so much!")
+            result = quiet(M.optimize_file, src)
+            out.append(("R9 --file writes <name>.optimized.txt next to the input",
+                        result is not None and os.path.basename(str(result)) == "spec.optimized.txt"
+                        and open(result, encoding="utf-8").read().strip() == "Write a poem about the sea."))
         L.CACHE.clear()
 
         # D16: curly quotes

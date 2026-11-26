@@ -1,9 +1,12 @@
 import re
 import sys
+import time
+import argparse
+from pathlib import Path
 from token_counter import count_tokens, compare_models
 from optimizer import (optimize, pre_clean, protected_parts, keyword_overlap, lost_constraints,
                        lost_requests, normalize_quotes, script_of, sentences_with, split_chunks,
-                       added_constraints, lost_sequence)
+                       added_constraints, lost_sequence, STRUCTURE_LINE, LIST_PREFIX)
 import llm_optimizer
 from llm_optimizer import (spell_fix, llm_optimize, needs_spell_fix, MAX_AI_TOKENS, MODEL, SPELL_MODEL,
                            remember_spell, forget_spell, remember_compression, forget_compression)
@@ -18,6 +21,10 @@ CHUNK_SIZE = 60         # tokens per chunk
 # a few sentences have few key words, so a good paraphrase ("platform" -> "marketplace") changes a
 # big share of them; chunks still get every other check (rules, numbers, requests, quotes, language)
 CHUNK_MIN_OVERLAP = 0.5
+SPELL_CHUNK_SIZE = 120  # tokens per chunk for the spell step (it only fixes typos, so bigger is fine)
+# a single AI call never gets more than MAX_AI_TOKENS (bigger prompts are chunked);
+# only truly huge prompts skip the AI altogether
+MAX_PROMPT_TOKENS = 50000
 # whole prompts need 60% of key words: terse rewrites swap many words, and every rule, number,
 # request, invented rule and step order is checked separately anyway
 
@@ -151,31 +158,13 @@ def pipeline(prompt):
         show("0 pre-clean", text)
 
     use_ai = USE_AI
-    if use_ai and count_tokens(text) > MAX_AI_TOKENS:
-        print(f"  [AI         ] skipped: prompt is over {MAX_AI_TOKENS} tokens, the model could cut it short")
+    if use_ai and count_tokens(text) > MAX_PROMPT_TOKENS:
+        print(f"  [AI         ] skipped: prompt is over {MAX_PROMPT_TOKENS} tokens")
         use_ai = False
 
     # Step 1: fix spelling FIRST, because every rule depends on correct words
-    if use_ai and not needs_spell_fix(text):
-        print("  [1 spell    ] skipped: no typos found")
-    elif use_ai:
-        # the small model first; if its answer is rejected, the main model gets one try
-        for model in dict.fromkeys([SPELL_MODEL, MODEL]):
-            label = "1 spell" if model == SPELL_MODEL else "1 spell 4b"
-            try:
-                fixed, secs = spell_fix(text, model)
-                ok, why = spelling_is_safe(text, fixed)
-                if ok:
-                    remember_spell(text, fixed, model)    # only accepted answers are cached
-                    text = restore_quote_style(text, fixed)
-                    show(label + " " + (f"{secs:.1f}s" if secs else "cache"), text)
-                    break
-                forget_spell(text, model)                 # a bad cached answer gets retried next time
-                print(f"  [{label:<11}] rejected: {why}")
-            except Exception as e:
-                print(f"  [{label:<11}] skipped: {e}")    # e.g. Ollama isn't running, or output cut off
-                if isinstance(e, (ConnectionError, OSError)):
-                    break                                 # no point trying another model
+    if use_ai:
+        text = spell_step(text)
 
     # Step 2: rules (greetings, please, thanks, small talk, filler, duplicates, symbols)
     rules_version = optimize(text)
@@ -187,7 +176,7 @@ def pipeline(prompt):
     # Step 3: AI compression, only worth it for longer prompts
     final = rules_version
     if use_ai and count_tokens(rules_version) > 8:
-        if count_tokens(rules_version) > CHUNK_ABOVE and "```" not in rules_version:
+        if count_tokens(rules_version) > CHUNK_ABOVE:
             final = compress_in_chunks(rules_version)
         else:
             final = compress(rules_version, "3 AI") or rules_version
@@ -235,23 +224,31 @@ def compress(text, label, verbose=True, min_overlap=0.6):
 
 
 def compress_in_chunks(text):
-    """Shorten a long prompt a few sentences at a time. Chunks the AI can't shorten
-    safely stay exactly as they were, so one mistake never costs the whole saving."""
+    """Shorten a long prompt a few sentences at a time. Headings, tables and code blocks are
+    kept as they are, list markers ("- ", "1. ") stay in place, and chunks the AI can't shorten
+    safely stay exactly as written -- so one mistake never costs the whole saving."""
     chunks = split_chunks(text, CHUNK_SIZE)
-    print(f"  [3 AI       ] long prompt: shortening {len(chunks)} chunks separately")
-    out = []
-    for i, (chunk, gap) in enumerate(chunks, 1):
-        label = f"3 AI {i}/{len(chunks)}"
-        if count_tokens(chunk) <= 8:
-            out.append(chunk + gap)
-            continue
-        short = compress(chunk, label, verbose=False, min_overlap=CHUNK_MIN_OVERLAP)
+    work = [i for i, (chunk, _) in enumerate(chunks)
+            if count_tokens(chunk) > 8 and not STRUCTURE_LINE.match(chunk)
+            and count_tokens(chunk) <= MAX_AI_TOKENS]
+    print(f"  [3 AI       ] long prompt: shortening {len(work)} of {len(chunks)} chunks separately")
+    out = [chunk + gap for chunk, gap in chunks]
+    start = time.perf_counter()
+    for n, i in enumerate(work, 1):
+        chunk, gap = chunks[i]
+        prefix = LIST_PREFIX.match(chunk)
+        prefix = prefix.group(0) if prefix else ""
+        body = chunk[len(prefix):]
+        label = f"3 AI {n}/{len(work)}"
+        short = compress(body, label, verbose=False, min_overlap=CHUNK_MIN_OVERLAP)
+        elapsed = time.perf_counter() - start
+        eta = elapsed / n * (len(work) - n)
+        timing = f"  ({elapsed:.0f}s, ~{eta:.0f}s left)" if len(work) > 3 else ""
         if short:
-            print(f"  [{label:<11}] {count_tokens(chunk):>3} → {count_tokens(short):>3} tokens ✅")
-            out.append(short + gap)
+            print(f"  [{label:<11}] {count_tokens(chunk):>3} → {count_tokens(prefix + short):>3} tokens ✅{timing}")
+            out[i] = prefix + short + gap
         else:
-            print(f"  [{label:<11}] {count_tokens(chunk):>3} tokens, kept as is (no safe shorter version)")
-            out.append(chunk + gap)
+            print(f"  [{label:<11}] {count_tokens(chunk):>3} tokens, kept as is (no safe shorter version){timing}")
     joined = "".join(out).strip()
     # final check on the whole result (numbers, quotes, language, rules across chunks)
     ok, why = compression_is_safe(text, joined, CHUNK_MIN_OVERLAP)
@@ -260,6 +257,61 @@ def compress_in_chunks(text):
         return text
     show("3 AI joined", joined)
     return joined
+
+
+def spell_one(text, verbose=True):
+    """Fix the spelling of one piece of text: the small model first, then the main model
+    if the small model's answer is rejected. Returns the fixed text, or None."""
+    for model in dict.fromkeys([SPELL_MODEL, MODEL]):
+        label = "1 spell" if model == SPELL_MODEL else "1 spell 4b"
+        try:
+            fixed, secs = spell_fix(text, model)
+        except Exception as e:
+            print(f"  [{label:<11}] skipped: {e}")        # e.g. Ollama isn't running, or output cut off
+            if isinstance(e, (ConnectionError, OSError)):
+                return None                             # no point trying another model
+            continue
+        ok, why = spelling_is_safe(text, fixed)
+        if ok:
+            remember_spell(text, fixed, model)          # only accepted answers are cached
+            fixed = restore_quote_style(text, fixed)
+            if verbose:
+                show(label + " " + (f"{secs:.1f}s" if secs else "cache"), fixed)
+            return fixed
+        forget_spell(text, model)                       # a bad cached answer gets retried next time
+        if verbose:
+            print(f"  [{label:<11}] rejected: {why}")
+    return None
+
+
+def spell_step(text):
+    """Step 1. Short prompts are fixed in one call; long prompts chunk by chunk,
+    and only the chunks that actually contain typos are sent to the model."""
+    if count_tokens(text) <= CHUNK_ABOVE:
+        if not needs_spell_fix(text):
+            print("  [1 spell    ] skipped: no typos found")
+            return text
+        return spell_one(text) or text
+    chunks = split_chunks(text, SPELL_CHUNK_SIZE)
+    todo = [i for i, (chunk, _) in enumerate(chunks)
+            if chunk.strip() and not STRUCTURE_LINE.match(chunk) and needs_spell_fix(chunk)]
+    if not todo:
+        print("  [1 spell    ] skipped: no typos found")
+        return text
+    print(f"  [1 spell    ] {len(todo)} of {len(chunks)} chunks have typos")
+    out = [chunk + gap for chunk, gap in chunks]
+    fixed_count = 0
+    for i in todo:
+        chunk, gap = chunks[i]
+        fixed = spell_one(chunk, verbose=False)
+        if fixed:
+            out[i] = fixed + gap
+            fixed_count += 1
+    print(f"  [1 spell    ] fixed {fixed_count} of {len(todo)} chunks")
+    result = "".join(out)
+    if result != text:
+        show("1 spell", result)
+    return result
 
 
 def report(prompt, final):
@@ -272,9 +324,13 @@ def report(prompt, final):
     b_cost, b_quality = split_scores(before_details)
     a_cost, a_quality = split_scores(details)
 
+    def preview(text, limit=3000):
+        if len(text) <= limit:
+            return text
+        return text[:2000] + f"\n   [... {len(text) - 2500} more characters ...]\n" + text[-500:]
     print("\n" + "=" * 50)
-    print("ORIGINAL :", prompt)
-    print("OPTIMIZED:", final)
+    print("ORIGINAL :", preview(prompt))
+    print("OPTIMIZED:", preview(final))
     print("=" * 50)
     print(f"Tokens        : {before_tokens} → {after_tokens}  (saved {saved}, {saved / max(before_tokens, 1):.0%})")
     print(f"Cost score    : {b_cost} → {a_cost}   (how token-efficient)")
@@ -320,14 +376,40 @@ def read_prompt(stream=None, interactive=None):
     return "\n".join(lines).strip()
 
 
+def optimize_file(in_path, out_path=None):
+    """Optimize the prompt in a text file and save the result. Returns the output path."""
+    in_path = Path(in_path)
+    prompt = in_path.read_text(encoding="utf-8").strip()
+    if not prompt:
+        print("Empty prompt.")
+        return None
+    started = time.perf_counter()
+    rules_version, final = pipeline(prompt)
+    report(prompt, final)
+    out_path = Path(out_path) if out_path else in_path.with_name(in_path.stem + ".optimized" + in_path.suffix)
+    out_path.write_text(final + "\n", encoding="utf-8")
+    print(f"\nSaved the optimized prompt to {out_path}  (took {time.perf_counter() - started:.0f}s)")
+    return out_path
+
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Optimize a prompt to use fewer tokens.")
+    parser.add_argument("--file", "-f", help="read the prompt from this text file")
+    parser.add_argument("--out", "-o", help="where to save the result (default: <file>.optimized.txt)")
+    args = parser.parse_args()
     try:
+        if args.file:
+            optimize_file(args.file, args.out)
+            sys.exit()
         prompt = read_prompt()
         if not prompt:
             print("Empty prompt.")
             sys.exit()
         rules_version, final = pipeline(prompt)
         report(prompt, final)
+        if args.out:
+            Path(args.out).write_text(final + "\n", encoding="utf-8")
+            print(f"\nSaved the optimized prompt to {args.out}")
     except (KeyboardInterrupt, EOFError):
         print("\nCancelled.")
         sys.exit(1)

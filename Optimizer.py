@@ -19,7 +19,12 @@ FILLER = {
     "basically ": "",
     "actually ": "",
     "obviously ": "",
+    " without any problems": "",
+    " without any issues": "",
+    " without any hassle": "",
 }
+
+SENTENCE_START = "\x00"      # temporary mark: "capitalize the next word"
 
 # verbs that start a request; "please" right before one of these is politeness
 REQUEST_VERBS = {"write", "explain", "help", "make", "create", "give", "tell", "list", "fix", "generate",
@@ -75,7 +80,13 @@ def remove_filler(text):
     for phrase, replacement in FILLER.items():
         # \b = whole words only, so a phrase can't match inside another word
         pattern = (r"\b" if phrase[0].isalnum() else "") + re.escape(phrase)
-        result = re.sub(pattern, replacement, result, flags=re.IGNORECASE)
+        def replace(m, replacement=replacement):
+            # removed at the start of a sentence: the next word now starts it ("The module ...")
+            at_start = re.search(r"(^|[.!?]\s+|\n)\x00?$", result[:m.start()]) is not None
+            if at_start and phrase[0].isalnum():
+                return SENTENCE_START + replacement
+            return replacement
+        result = re.sub(pattern, replace, result, flags=re.IGNORECASE)
     result = remove_please(result)
     # "some kind of admin panel" -> "an admin panel"
     result = re.sub(r"\b([Ss])ome (?:kind|sort) of (?=(\w))",
@@ -84,6 +95,9 @@ def remove_filler(text):
     # "make sure (that) X" -> "ensure X", keeping a capital at the start of a sentence
     result = re.sub(r"\b([Mm])ake sure(?: that)?\b",
                     lambda m: "Ensure" if m.group(1) == "M" else "ensure", result)
+    # capitalize the words that now start a sentence, then drop the marks
+    result = re.sub(SENTENCE_START + r"+(\S+)", lambda m: capitalize_first(m.group(1)), result)
+    result = result.replace(SENTENCE_START, "")
     # "(please) can you write ..." at the start of a sentence -> "write ..."; only before a request verb,
     # so a real question like "Can you swim?" stays
     def can_you(m):
@@ -352,9 +366,22 @@ def _count_number(num, text):
     return len(re.findall(rf"(?<![\d.,]){re.escape(num)}(?![.,]?\d)", text))
 
 
+def _stem(word):
+    """Cut common endings: orders -> order, modifies -> modifi, modifying -> modify, lyrical -> lyric."""
+    for suffix in ("ations", "ation", "ings", "ing", "ies", "ied", "es", "ed", "ly", "al", "s"):
+        if word.endswith(suffix) and len(word) - len(suffix) >= 3:
+            return word[:-len(suffix)]
+    return word
+
+
 def _same_word(a, b):
-    """Same word ignoring endings: the first 4 letters match (sort/sorts, dict/dictionaries)."""
-    return a[:4] == b[:4]
+    """Same word ignoring endings. Stems must share 5 letters ("overcomplicate" is NOT
+    "oversimplification"); a short stem only needs to start the other (dict / dictionaries)."""
+    a, b = _stem(a), _stem(b)
+    short, long_ = sorted((a, b), key=len)
+    if len(short) <= 4:
+        return long_.startswith(short)
+    return a[:5] == b[:5]
 
 
 def _content_words(text, extra_skip=()):
@@ -382,26 +409,41 @@ def _negated(word, words, window=4, allow_only=False):
 def split_chunks(text, max_tokens=60):
     """Split a long prompt into chunks of whole sentences, each about max_tokens long.
     Returns [(chunk, gap_after)], where "".join(chunk + gap) gives back the exact text.
-    Quoted text and code are never split (they're protected while splitting)."""
+    A chunk never crosses a line break, so paragraphs, list items, headings and tables keep
+    their shape. Quoted text and code blocks are never split (protected while splitting)."""
     prot, saved = protect(text)
     marker = saved.marker
-    pieces = re.split(r"(?<=[.!?])(\s+)", prot)          # sentence, gap, sentence, gap, ...
-    chunks, body = [], ""
-    for i in range(0, len(pieces), 2):
-        sentence = pieces[i]
-        gap = pieces[i + 1] if i + 1 < len(pieces) else ""
-        if body.strip() and count_tokens(body + sentence) > max_tokens:
-            chunks.append(body)
-            body = ""
-        body += sentence + gap
-    if body:
-        chunks.append(body)
+    raw = []
+    lines = re.split(r"(\n+)", prot)                       # line, newlines, line, newlines, ...
+    for i in range(0, len(lines), 2):
+        line = lines[i]
+        newlines = lines[i + 1] if i + 1 < len(lines) else ""
+        pieces = re.split(r"(?<=[.!?])(\s+)", line)       # sentence, gap, sentence, gap, ...
+        line_chunks, body = [], ""
+        for j in range(0, len(pieces), 2):
+            sentence = pieces[j]
+            gap = pieces[j + 1] if j + 1 < len(pieces) else ""
+            if body.strip() and count_tokens(body + sentence) > max_tokens:
+                line_chunks.append(body)
+                body = ""
+            body += sentence + gap
+        line_chunks.append(body)
+        line_chunks[-1] += newlines
+        raw.extend(line_chunks)
     out = []
-    for chunk in chunks:
+    for chunk in raw:
+        if not chunk:
+            continue
         chunk = re.sub(rf"{marker}(\d+){marker}", lambda m: saved[int(m.group(1))], chunk)
         stripped = chunk.rstrip()
         out.append((stripped, chunk[len(stripped):]))
     return out
+
+
+# lines that are structure, not prose: never sent to the AI
+STRUCTURE_LINE = re.compile(r"^\s*(#|\||```|~~~|<[a-zA-Z/!])")
+# list markers kept outside the AI: "- ", "* ", "1. ", "2) "
+LIST_PREFIX = re.compile(r"^\s*(?:[-*+•]|\d+[.)])\s+")
 
 
 def sentences_with(text, fragments):
@@ -484,6 +526,14 @@ def lost_requests(before, after):
     for m in re.finditer(r"\b(and|also|plus)\b((?:\s+[\w']+){1,4})", before.lower()):
         # skip verbs ("and explain why...") and negations ("and never modifies...")
         words = _content_words(m.group(2), extra_skip=REQUEST_VERBS)
+        if not words:
+            # only a verb follows ("and explain how everything will work"): the verb is the request.
+            # Just a real request verb right after "and" -- not helpers like do/give/make/use
+            first = (_words(m.group(2)) or [""])[0]
+            if (first in REQUEST_VERBS and first not in GENERIC_VERBS and first not in NOT_SUBJECTS
+                    and first not in {"do", "go", "let", "add", "keep", "note", "help"}
+                    and not re.search(rf"\b{NEGATIONS}\b", m.group(2))):
+                words = [first]
         if words and not any(_same_word(a, w) for w in words for a in after_words):
             lost.append(words[0])
     return lost
