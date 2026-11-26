@@ -608,6 +608,59 @@ def safety_checks():
         out.append(("R5 retry that keeps every rule is accepted", "don't make it too basic" in final.lower()))
         L.CACHE.clear()
 
+        # Round 6: long prompts are shortened in chunks
+        from optimizer import split_chunks
+        long_text = ('Build a shop. Sellers upload products with images and prices. Say "Hello. World." on the home page. '
+                     "Customers browse, search and order. Admins manage users and orders. "
+                     "Don't overcomplicate it, but don't make it too basic either. Keep it secure and easy to extend. "
+                     "Sellers only see their own orders. Customers can track orders.\n\nExplain the architecture first.")
+        parts = split_chunks(long_text, 25)
+        out.append(("R6 chunks join back to the exact original text", "".join(c + g for c, g in parts) == long_text))
+        out.append(("R6 quoted text is never split across chunks", any('"Hello. World."' in c for c, g in parts)))
+        out.append(("R6 long prompt is split into several chunks", len(parts) >= 3))
+
+        ok_chunk, _ = M.compression_is_safe("Security is important, and new features must be easy to add later.",
+                                            "Make it secure; new features easy to add later.", M.CHUNK_MIN_OVERLAP)
+        out.append(("R6 a paraphrased chunk passes the chunk key-word bar", ok_chunk))
+
+        class ChunkModel:
+            """Shortens every chunk, but in the chunk with the 'overcomplicate' rule it drops the rule."""
+            def __init__(self):
+                self.calls = 0
+            def chat(self, model, messages, **kwargs):
+                self.calls += 1
+                text = messages[1]["content"].split("Original: ", 1)[1].split("\n")[0]
+                text = (text.replace("should be able to ", "can ").replace("I want sellers to ", "Sellers ")
+                            .replace("Don't overcomplicate it, but don't make it too basic either.", "Keep it balanced."))
+                return FakeResponse(f"<prompt>{text}</prompt>")
+        shop_long = ("I want sellers to create accounts and upload products with images and descriptions and prices. "
+                     "Customers should be able to browse products and search for products and place orders. "
+                     "Customers should be able to track their orders and see their order history. "
+                     "Administrators should be able to manage users and products and orders from an admin panel. "
+                     "Don't overcomplicate it, but don't make it too basic either. "
+                     "Sellers should be able to see their own orders but not the orders of other sellers.")
+        L.client = ChunkModel()
+        M.USE_AI = True
+        log = io.StringIO()
+        with redirect_stdout(log):
+            _, final = M.pipeline(shop_long)
+        M.USE_AI = False
+        out.append(("R6 long prompt uses the chunked path", "chunks separately" in log.getvalue()))
+        out.append(("R6 chunked result is shorter", count_tokens(final) < count_tokens(shop_long)))
+        out.append(("R6 the chunk that lost a rule is kept exactly as written",
+                    "Don't overcomplicate it, but don't make it too basic either." in final))
+        out.append(("R6 the other chunks are still shortened", "can browse" in final))
+
+        code_long = "Fix this code and explain every change in detail please. " * 6 + "\n```\nprint('x')\n```"
+        log = io.StringIO()
+        L.client = ChunkModel()
+        M.USE_AI = True
+        with redirect_stdout(log):
+            M.pipeline(code_long)
+        M.USE_AI = False
+        out.append(("R6 prompts with code blocks are not chunked", "chunks separately" not in log.getvalue()))
+        L.CACHE.clear()
+
         # D16: curly quotes
         ok, _ = M.compression_is_safe("Please analyze the song “Let It Be” by The Beatles and explain why it became so popular.",
                                       'Analyze the song "Let It Be" by The Beatles and explain why it became popular.')

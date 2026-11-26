@@ -377,6 +377,31 @@ def _negated(word, words, window=4, allow_only=False):
     return False
 
 
+def split_chunks(text, max_tokens=60):
+    """Split a long prompt into chunks of whole sentences, each about max_tokens long.
+    Returns [(chunk, gap_after)], where "".join(chunk + gap) gives back the exact text.
+    Quoted text and code are never split (they're protected while splitting)."""
+    prot, saved = protect(text)
+    marker = saved.marker
+    pieces = re.split(r"(?<=[.!?])(\s+)", prot)          # sentence, gap, sentence, gap, ...
+    chunks, body = [], ""
+    for i in range(0, len(pieces), 2):
+        sentence = pieces[i]
+        gap = pieces[i + 1] if i + 1 < len(pieces) else ""
+        if body.strip() and count_tokens(body + sentence) > max_tokens:
+            chunks.append(body)
+            body = ""
+        body += sentence + gap
+    if body:
+        chunks.append(body)
+    out = []
+    for chunk in chunks:
+        chunk = re.sub(rf"{marker}(\d+){marker}", lambda m: saved[int(m.group(1))], chunk)
+        stripped = chunk.rstrip()
+        out.append((stripped, chunk[len(stripped):]))
+    return out
+
+
 def sentences_with(text, fragments):
     """The full sentences of `text` that contain each fragment (used to tell the AI exactly what to keep)."""
     sentences = re.split(r"(?<=[.!?])\s+", text)

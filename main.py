@@ -2,13 +2,21 @@ import re
 import sys
 from token_counter import count_tokens, compare_models
 from optimizer import (optimize, pre_clean, protected_parts, keyword_overlap, lost_constraints,
-                       lost_requests, normalize_quotes, script_of, sentences_with)
+                       lost_requests, normalize_quotes, script_of, sentences_with, split_chunks)
 import llm_optimizer
 from llm_optimizer import (spell_fix, llm_optimize, needs_spell_fix, MAX_AI_TOKENS, MODEL, SPELL_MODEL,
                            remember_spell, forget_spell, remember_compression, forget_compression)
 from scorer import rate, grade, split_scores
 
 USE_AI = True
+
+# prompts longer than this are shortened in chunks of a few sentences: a small model
+# keeps every rule much more reliably in short pieces, and one bad piece only costs that piece
+CHUNK_ABOVE = 80        # tokens
+CHUNK_SIZE = 60         # tokens per chunk
+# a few sentences have few key words, so a good paraphrase ("platform" -> "marketplace") changes a
+# big share of them; chunks still get every other check (rules, numbers, requests, quotes, language)
+CHUNK_MIN_OVERLAP = 0.5
 
 # common Roman Urdu words; if the input has them and the output doesn't, it was translated
 ROMAN_URDU = {"hai", "ho", "mujhe", "karo", "likh", "likho", "nahi", "bhai", "ka", "ki", "ke",
@@ -95,7 +103,7 @@ def spelling_is_safe(original, fixed):
     return True, ""
 
 
-def compression_is_safe(before, after):
+def compression_is_safe(before, after, min_overlap=0.7):
     """A compressed prompt must keep quoted text, rules, numbers, every request,
     the same language, most key words, and be shorter."""
     if not after.strip():
@@ -113,7 +121,7 @@ def compression_is_safe(before, after):
     if why:
         return False, why
     overlap = keyword_overlap(before, after)
-    if overlap < 0.7:
+    if overlap < min_overlap:
         return False, f"kept only {overlap:.0%} of the key words, it probably changed the meaning"
     if count_tokens(after) >= count_tokens(before):
         return False, "not shorter"
@@ -170,33 +178,74 @@ def pipeline(prompt):
     # Step 3: AI compression, only worth it for longer prompts
     final = rules_version
     if use_ai and count_tokens(rules_version) > 8:
-        feedback = ""
-        for attempt in (1, 2):                       # one retry, told what was wrong
-            label = "3 AI" if attempt == 1 else "3 AI retry"
-            try:
-                raw, secs = llm_optimize(rules_version, feedback)
-            except Exception as e:
-                print(f"  [{label:<11}] skipped: {e}")
-                break
-            short = optimize(raw)                    # clean the AI output with the rules too
-            ok, why = compression_is_safe(rules_version, short)
-            if ok:
-                remember_compression(rules_version, raw)
-                final = restore_quote_style(rules_version, short)
-                show(label + " " + (f"{secs:.1f}s" if secs else "cache"), final)
-                break
-            forget_compression(rules_version)
-            print(f"  [{label:<11}] rejected: {why} -> {short[:300]}")
-            # only retry when the model left something out; other problems won't improve
-            if not why.startswith(("dropped requests", "lost rules or numbers", "kept only")):
-                break
-            # quote the full original sentences, so the model knows exactly what to keep
-            missing = lost_constraints(rules_version, short) + lost_requests(rules_version, short)
-            keep = sentences_with(rules_version, missing)
-            feedback = why.replace("dropped requests:", "dropped these requests:")
-            if keep:
-                feedback += ". It must still say everything in these sentences: " + " ".join(f'"{k}"' for k in keep)
+        if count_tokens(rules_version) > CHUNK_ABOVE and "```" not in rules_version:
+            final = compress_in_chunks(rules_version)
+        else:
+            final = compress(rules_version, "3 AI") or rules_version
     return rules_version, final
+
+def compress(text, label, verbose=True, min_overlap=0.7):
+    """Shorten `text` with the AI: one try, plus one retry told what was missing.
+    Returns the safe shorter version, or None if both tries were rejected."""
+    feedback = ""
+    for attempt in (1, 2):
+        name = label if attempt == 1 else label + " retry"
+        try:
+            raw, secs = llm_optimize(text, feedback)
+        except Exception as e:
+            print(f"  [{name:<11}] skipped: {e}")
+            return None
+        short = optimize(raw)                        # clean the AI output with the rules too
+        ok, why = compression_is_safe(text, short, min_overlap)
+        if ok:
+            remember_compression(text, raw)          # only accepted answers are cached
+            short = restore_quote_style(text, short)
+            if verbose:
+                show(name + " " + (f"{secs:.1f}s" if secs else "cache"), short)
+            return short
+        forget_compression(text)
+        if verbose:
+            print(f"  [{name:<11}] rejected: {why} -> {short[:300]}")
+        # only retry when the model left something out; other problems won't improve
+        if not why.startswith(("dropped requests", "lost rules or numbers", "kept only")):
+            return None
+        missing = lost_constraints(text, short) + lost_requests(text, short)
+        keep = sentences_with(text, missing)
+        feedback = why.replace("dropped requests:", "dropped these requests:")
+        if keep:
+            # say clearly that the WHOLE original must be compressed again (not just these sentences)
+            feedback += (". Compress the whole original again. Your new version must still include the meaning of: "
+                         + " ".join(f'"{k}"' for k in keep))
+    return None
+
+
+def compress_in_chunks(text):
+    """Shorten a long prompt a few sentences at a time. Chunks the AI can't shorten
+    safely stay exactly as they were, so one mistake never costs the whole saving."""
+    chunks = split_chunks(text, CHUNK_SIZE)
+    print(f"  [3 AI       ] long prompt: shortening {len(chunks)} chunks separately")
+    out = []
+    for i, (chunk, gap) in enumerate(chunks, 1):
+        label = f"3 AI {i}/{len(chunks)}"
+        if count_tokens(chunk) <= 8:
+            out.append(chunk + gap)
+            continue
+        short = compress(chunk, label, verbose=False, min_overlap=CHUNK_MIN_OVERLAP)
+        if short:
+            print(f"  [{label:<11}] {count_tokens(chunk):>3} → {count_tokens(short):>3} tokens ✅")
+            out.append(short + gap)
+        else:
+            print(f"  [{label:<11}] {count_tokens(chunk):>3} tokens, kept as is (no safe shorter version)")
+            out.append(chunk + gap)
+    joined = "".join(out).strip()
+    # final check on the whole result (numbers, quotes, language, rules across chunks)
+    ok, why = compression_is_safe(text, joined, CHUNK_MIN_OVERLAP)
+    if not ok:
+        print(f"  [3 AI       ] joined result rejected: {why}, keeping the rules version")
+        return text
+    show("3 AI joined", joined)
+    return joined
+
 
 def report(prompt, final):
     before_score, before_details = rate(prompt)
