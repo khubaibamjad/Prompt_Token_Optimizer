@@ -3,7 +3,8 @@ import sys
 from token_counter import count_tokens, compare_models
 from optimizer import (optimize, pre_clean, protected_parts, keyword_overlap, lost_constraints,
                        lost_requests, normalize_quotes, script_of)
-from llm_optimizer import (spell_fix, llm_optimize, needs_spell_fix, MAX_AI_TOKENS,
+import llm_optimizer
+from llm_optimizer import (spell_fix, llm_optimize, needs_spell_fix, MAX_AI_TOKENS, MODEL, SPELL_MODEL,
                            remember_spell, forget_spell, remember_compression, forget_compression)
 from scorer import rate, grade, split_scores
 
@@ -43,6 +44,29 @@ def changed_language(before, after):
     return ""
 
 
+def _word_count(text):
+    """Number of words, counting a run of the same word ("hi hi hi") once."""
+    words = re.findall(r"\w+", text.lower())
+    return sum(1 for i, w in enumerate(words) if i == 0 or w != words[i - 1])
+
+
+def kept_correct_words(original, fixed):
+    """Share of the correctly spelled words in `original` that are still in `fixed`.
+    A spelling fix keeps them; a model that answers or rewrites the prompt doesn't."""
+    fixed_words = set(re.findall(r"\w+", fixed.lower()))
+    words = list(dict.fromkeys(re.findall(r"[a-z]+", original.lower())))
+    speller = llm_optimizer.SPELLER
+    known = [w for w in words if speller is not None and len(w) > 1 and w in speller]
+    if len(known) >= 3:
+        return sum(w in fixed_words for w in known) / len(known), 0.75
+    # no dictionary, or mostly non-English (Roman Urdu): compare all words by their first 4 letters
+    words = [w for w in re.findall(r"\w+", original.lower()) if len(w) > 1]
+    if len(words) < 3:
+        return 1.0, 0.0
+    prefixes = {w[:4] for w in fixed_words}
+    return sum(w[:4] in prefixes for w in words) / len(words), 0.6
+
+
 def spelling_is_safe(original, fixed):
     """A spell fix must keep quoted text, numbers and negations, the same language,
     and stay about the same length."""
@@ -57,10 +81,17 @@ def spelling_is_safe(original, fixed):
     why = changed_language(original, fixed)
     if why:
         return False, why
-    before, after = count_tokens(original), count_tokens(fixed)
+    kept, needed = kept_correct_words(original, fixed)
+    if kept < needed:
+        return False, f"kept only {kept:.0%} of the correctly spelled words, it probably answered or rewrote"
+    # compare WORDS, not tokens: fixing junk like "plaeaessesse" -> "please" saves many tokens
+    # but keeps the number of words. Repeats ("hi hi hi") are counted once.
+    before, after = _word_count(original), _word_count(fixed)
     ratio = after / max(before, 1)
-    if not (0.85 <= ratio <= 1.3 or abs(after - before) <= 3):   # small prompts may shift a few tokens
-        return False, f"length changed too much ({ratio:.2f}x), it probably rewrote, cut or answered"
+    # 0.7 (not 0.85): fixing typos merges repeats ("helo hello" -> "hello hello"); answers and
+    # cut-off output are already caught by kept_correct_words above
+    if not (0.7 <= ratio <= 1.3 or abs(after - before) <= 2):    # small prompts may shift a word or two
+        return False, f"length changed too much ({ratio:.2f}x words), it probably rewrote, cut or answered"
     return True, ""
 
 
@@ -111,18 +142,23 @@ def pipeline(prompt):
     if use_ai and not needs_spell_fix(text):
         print("  [1 spell    ] skipped: no typos found")
     elif use_ai:
-        try:
-            fixed, secs = spell_fix(text)
-            ok, why = spelling_is_safe(text, fixed)
-            if ok:
-                remember_spell(text, fixed)          # only accepted answers are cached
-                text = restore_quote_style(text, fixed)
-                show("1 spell " + (f"{secs:.1f}s" if secs else "cache"), text)
-            else:
-                forget_spell(text)                   # a bad cached answer gets retried next time
-                print(f"  [1 spell    ] rejected: {why}")
-        except Exception as e:
-            print(f"  [1 spell    ] skipped: {e}")   # e.g. Ollama isn't running, or output cut off
+        # the small model first; if its answer is rejected, the main model gets one try
+        for model in dict.fromkeys([SPELL_MODEL, MODEL]):
+            label = "1 spell" if model == SPELL_MODEL else "1 spell 4b"
+            try:
+                fixed, secs = spell_fix(text, model)
+                ok, why = spelling_is_safe(text, fixed)
+                if ok:
+                    remember_spell(text, fixed, model)    # only accepted answers are cached
+                    text = restore_quote_style(text, fixed)
+                    show(label + " " + (f"{secs:.1f}s" if secs else "cache"), text)
+                    break
+                forget_spell(text, model)                 # a bad cached answer gets retried next time
+                print(f"  [{label:<11}] rejected: {why}")
+            except Exception as e:
+                print(f"  [{label:<11}] skipped: {e}")    # e.g. Ollama isn't running, or output cut off
+                if isinstance(e, (ConnectionError, OSError)):
+                    break                                 # no point trying another model
 
     # Step 2: rules (greetings, please, thanks, small talk, filler, duplicates, symbols)
     rules_version = optimize(text)

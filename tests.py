@@ -232,13 +232,35 @@ RULE_TESTS = [
      [], [], 'Run the pls command'),
     ("R2-3 mid-sentence 'plz' removed",
      'can you plz write a poem',
-     [], [], 'can you write a poem'),
+     [], [], 'Write a poem'),            # round 3: "can you" before a request verb is removed too
     ("R2-4 repeated 'pls' fully collapsed before a request",
      'pls pls pls write a poem',
      [], [], 'Write a poem'),
     ("R2-4 repeated 'thx' collapsed, then removed as closing thanks",
      'Write a poem. thx thx thx',
      [], [], 'Write a poem.'),
+    # ---- round 3 regression tests ----
+    ('R3 chained greetings removed',
+     'hi hello helo, write a poem',
+     [], [], 'Write a poem'),
+    ('R3 chained greetings before small talk',
+     'hi hello how are you',
+     [], [], 'How are you'),
+    ('R3 small talk followed by a name',
+     'how you doing boi please write a poem',
+     [], [], 'Write a poem'),
+    ("R3 'can you please' before a verb removed",
+     'hi, can you please explain recursion',
+     [], [], 'Explain recursion'),
+    ("R3 'can u' before a verb removed",
+     'can u write a poem',
+     [], [], 'Write a poem'),
+    ("R3 a real 'can you' question kept",
+     'Can you swim?',
+     [], [], 'Can you swim?'),
+    ("R3 'can you' mid-sentence kept",
+     'I wonder if you can you write it',
+     [], [], 'I wonder if you can you write it'),
 ]
 
 # Known problems we'll fix later: shown as warnings, not failures
@@ -331,7 +353,7 @@ def safety_checks():
     """(name, passed?) for checks on main.py and llm_optimizer.py, using fake model outputs."""
     import llm_optimizer as L
     import main as M
-    from optimizer import protect, restore, optimize
+    from optimizer import protect, restore, optimize, keyword_overlap
     from scorer import rate
     from token_counter import count_tokens
 
@@ -462,6 +484,43 @@ def safety_checks():
                     quiet(M.read_prompt, io.StringIO("One.\n\nTwo.\n\n\nignored\n"), True) == "One.\n\nTwo."))
         out.append(("R2 piped input reads past two empty lines",
                     M.read_prompt(io.StringIO("One.\n\n\nTwo.\n"), interactive=False) == "One.\n\n\nTwo."))
+
+        # Round 3: chatty prompt with heavy typos
+        leave_raw = ("hi hi hi hello helo haeylo how you doing boi please pls pls pls cam u write "
+                     "email fr leav ? plaeaessesse")
+        answer = ("Subject: Leave Request. Dear Manager, I would like to request leave for tomorrow "
+                  "due to personal reasons. Thank you.")
+        good_fix = ("hi hi hi hello hello hello how you doing boy please please please please can you "
+                    "write email for leave? please")
+        ok, _ = M.spelling_is_safe(leave_raw, answer)
+        out.append(("R3 spell step that ANSWERS the prompt is rejected", not ok))
+        ok, why = M.spelling_is_safe(leave_raw, good_fix)
+        out.append(("R3 correct fix of junk-heavy typos is accepted" + ("" if ok else f" ({why})"), ok))
+        ok, _ = M.spelling_is_safe("mujhe ek email leik do manager ko ke main kal nai aa skta",
+                                   "mujhe ek email likh do manager ko ke main kal nahi aa sakta")
+        out.append(("R3 Roman Urdu typo fix is still accepted", ok))
+        out.append(("R3 greetings and small talk don't count as key words",
+                    keyword_overlap("hello friend, doing well? write a leave email for tomorrow morning",
+                                    "Write a leave email for tomorrow morning.") >= 0.7))
+
+        class TwoModels:
+            """1b answers the prompt, 4b fixes the spelling correctly."""
+            calls = []
+            def chat(self, model, messages, **kwargs):
+                self.calls.append(model)
+                if messages[0]["content"].startswith("You fix spelling"):
+                    text = answer if model == L.SPELL_MODEL else good_fix
+                else:
+                    text = "Write a leave email."
+                return FakeResponse(f"<prompt>{text}</prompt>")
+        L.client = TwoModels()
+        M.USE_AI = True
+        _, final = quiet(M.pipeline, leave_raw)
+        M.USE_AI = False
+        out.append(("R3 bad 1b spell answer -> 4b retry is used", L.MODEL in TwoModels.calls))
+        out.append((f"R3 the chatty leave prompt ends up as a short request ({final!r})",
+                    final == "Write email for leave?"))
+        L.CACHE.clear()                              # don't leak cached answers into later checks
 
         # D16: curly quotes
         ok, _ = M.compression_is_safe("Please analyze the song “Let It Be” by The Beatles and explain why it became so popular.",

@@ -74,6 +74,16 @@ def remove_filler(text):
         pattern = (r"\b" if phrase[0].isalnum() else "") + re.escape(phrase)
         result = re.sub(pattern, replacement, result, flags=re.IGNORECASE)
     result = remove_please(result)
+    # "(please) can you write ..." at the start of a sentence -> "write ..."; only before a request verb,
+    # so a real question like "Can you swim?" stays
+    def can_you(m):
+        verb = m.group("verb")
+        if verb.lower() not in REQUEST_VERBS:
+            return m.group(0)
+        sentence_start = re.search(r"(^|[.!?\n])\s*$", result[:m.start()])
+        return m.group("lead") + (capitalize_first(verb) if sentence_start else verb)
+    result = re.sub(r"(?P<lead>^|(?<=[.!?])[ \t]+|(?<=\n))(?:please\s+)?(?:can|could|would|will)\s+(?:you|u)\s+(?:please\s+)?(?P<verb>[A-Za-z]+)",
+                    can_you, result, flags=re.IGNORECASE)
     # " for me" only right after a request verb ("summarize this article for me"),
     # never in "Is this plan right for me?"
     result = re.sub(r"\b((?:write|make|create|generate|find|summari[sz]e|draft|translate)\b[^.?!\n]{0,40}?)[ \t]+for me\b",
@@ -159,17 +169,26 @@ def pre_clean(text):
         return original                   # never lose protected text
 
 
-ADDRESS_WORDS = r"(bhai|bro|sir|yaar|janab|there|team|all|everyone|baby|babe|babay|jaan|dost|friend)"
+ADDRESS_WORDS = r"(bhai|bro|sir|yaar|janab|there|team|all|everyone|baby|babe|babay|jaan|dost|friend|boy|boi|dude)"
+# greetings, including common typos (helo, hallo, hii, heyy)
+GREETING_WORDS = r"(hello|helo|hallo|hii+|hi|heyy*|dear|salam|salaam|assalam[u-]?\s?o?\s?alaikum|aoa)"
 
 def remove_greeting(text):
     # removes greetings like "hello,", "hi bhai", "salam sir" only at the START, and only when
     # followed by punctuation, an address word, or small talk -- so "Hello World program"
     # and "Hey Jude lyrics" stay. Something must be left afterwards.
-    cleaned = re.sub(
-        r"^\s*(hello|hi|hey|dear|salam|salaam|assalam[u-]?\s?o?\s?alaikum|aoa)\b"
-        r"(?:\s*[,!.]+|\s+((mere|meri|my|dear)\s+)?" + ADDRESS_WORDS + r"\b[,!.]?"
-        r"|(?=\s+(how\s+(are|r)\s+(you|u)|kese|kaise|kesy|kya\s+haal)\b))\s*",
-        "", text, flags=re.IGNORECASE)
+    # a run of greetings ("hi hello helo ...") is removed one by one
+    cleaned = text
+    for _ in range(5):
+        step = re.sub(
+            r"^\s*" + GREETING_WORDS + r"\b"
+            r"(?:\s*[,!.]+|\s+((mere|meri|my|dear)\s+)?" + ADDRESS_WORDS + r"\b[,!.]?"
+            r"|(?=\s+(how\s+((are|r)\s+)?(you|u)|kese|kaise|kesy|kya\s+haal)\b)"
+            r"|(?=\s+" + GREETING_WORDS + r"\b))\s*",
+            "", cleaned, flags=re.IGNORECASE)
+        if step == cleaned:
+            break
+        cleaned = step
     return cleaned if cleaned.strip() else text
 
 def remove_pleasantries(text):
@@ -180,7 +199,9 @@ def remove_small_talk(text):
     """Remove "how are you doing?" and "can you do that?" -- but only when
     something else is left, because sometimes "how are you" IS the question."""
     # only a full "how are you" sentence: followed by ? . ! , or the end of the text
-    cleaned = re.sub(r"\bhow (are|r) (you|u)( doing| today)?\s*(?:[?.!,]+\s*|$)", "", text, flags=re.IGNORECASE)
+    # ...or followed by an address word: "how you doing boi, write ..."
+    cleaned = re.sub(r"\bhow ((are|r) )?(you|u)( doing| today)?"
+                     r"(?:\s*[?.!,]+\s*|\s+" + ADDRESS_WORDS + r"\b[?.!,]*\s*|\s*$)", "", text, flags=re.IGNORECASE)
     # Roman Urdu: "kese ho aap", "kya haal chaal hai apka"
     cleaned = re.sub(r"\b(kese|kaise|kesy|kaisay|kaisy|kesay|kesi|kaisi)\s+(ho|hain|hn|hai)(\s+(aap|ap|app|tum))?\s*[?.!]*\s*", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\bkya\s+haal(\s+chaal)?\s+(hai|he|h|hain)(\s+(apka|aapka|apkaa|tumhara))?\s*[?.!]*\s*", "", cleaned, flags=re.IGNORECASE)
@@ -269,7 +290,10 @@ STOPWORDS = {"the", "and", "that", "this", "with", "for", "from", "your", "what"
              "which", "about", "into", "have", "will", "would", "should", "could", "there",
              "want", "like", "something", "because", "feeling", "come", "just", "please",
              "very", "really", "some", "also", "make", "sure", "thank", "thanks", "tell",
-             "either", "answer", "must", "help", "them", "they", "then", "than", "been", "between"}
+             "either", "answer", "must", "help", "them", "they", "then", "than", "been", "between",
+             # greetings and small talk carry no meaning for the task
+             "hello", "helo", "hallo", "doing", "today", "well", "dude", "friend", "dost", "bhai",
+             "yaar", "jaan", "baby", "babe", "dear"}
 
 # words that are never the subject of a rule or request ("avoid USING jargon", "and WANTS protein")
 NOT_SUBJECTS = {"want", "wants", "wanted", "need", "needs", "like", "sound", "seem", "look", "feel",

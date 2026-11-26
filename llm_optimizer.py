@@ -198,14 +198,14 @@ def needs_spell_fix(text):
     return bool(SPELLER.unknown([w.strip("'") for w in words if len(w) > 1]))
 
 
-def spell_fix(prompt):
-    return ask(SPELL_SYSTEM, prompt, SPELL_MODEL)
+def spell_fix(prompt, model=None):
+    return ask(SPELL_SYSTEM, prompt, model or SPELL_MODEL)
 
-def remember_spell(prompt, reply):
-    remember(SPELL_SYSTEM, SPELL_MODEL, prompt, reply)
+def remember_spell(prompt, reply, model=None):
+    remember(SPELL_SYSTEM, model or SPELL_MODEL, prompt, reply)
 
-def forget_spell(prompt):
-    forget(SPELL_SYSTEM, SPELL_MODEL, prompt)
+def forget_spell(prompt, model=None):
+    forget(SPELL_SYSTEM, model or SPELL_MODEL, prompt)
 
 
 def llm_optimize(prompt):
