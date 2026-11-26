@@ -40,9 +40,26 @@ def remove_please(text):
     def at_start(m):
         if m.group("w").isupper() and m.group("w").lower() != "please":
             return m.group(0)                      # "PLS" is an acronym
-        return m.group("lead")
-    text = re.sub(r"(?P<lead>^|(?<=[.!?,;:])[ \t]+|(?<=\n))(?P<w>please|pls|plz)\b[.!,]?[ \t]*",
+        nxt = m.group("next") or ""
+        # at a sentence start (not after , ; :) the next word now starts the sentence
+        if re.search(r"(^|[.!?\n])[ \t]*$", text[:m.start("w")]):
+            nxt = capitalize_first(nxt)
+        return m.group("lead") + nxt
+    text = re.sub(r"(?P<lead>^|(?<=[.!?,;:])[ \t]+|(?<=\n))(?P<w>please|pls|plz)\b[.!,]?[ \t]*(?P<next>\S+)?",
                   at_start, text, flags=re.IGNORECASE)
+
+    # lowercase "pls" / "plz" in the middle of a sentence is politeness too, except when it's
+    # a name ("the pls tool", "pls command") or an item in a list ("lsp and pls and spl")
+    def mid_sentence(m):
+        before = text[:m.start()].split()[-1:] or [""]
+        after = text[m.end():].split()[:1] or [""]
+        b, a = before[0].lower().strip(",;"), after[0].lower().strip(",;.!?")
+        if b in {"the", "a", "an"} or a in {"tool", "command", "file", "package", "regression", "method"}:
+            return m.group(0)
+        if b in {"and", "or"} and a in {"and", "or"}:
+            return m.group(0)
+        return ""
+    text = re.sub(r"(?<![\w'])(?:pls|plz)\b[ \t]*", mid_sentence, text)
 
     # right before a request verb: "... and please write a poem"
     def before_verb(m):
@@ -66,7 +83,8 @@ def remove_filler(text):
 # Only these words are collapsed when repeated ("the the", "hello hello").
 # Other repeats may be intentional ("Bora Bora", "no no no", "knock knock").
 REPEATABLE = {"the", "a", "an", "is", "to", "of", "in", "on", "and", "or", "for", "it", "i", "be",
-              "are", "was", "that", "this", "with", "hello", "hi", "hey", "please", "thanks"}
+              "are", "was", "that", "this", "with", "hello", "hi", "hey", "please", "thanks",
+              "pls", "plz", "thx"}
 
 def remove_repeated_words(text):
     # "hello hello" → "hello",  "the the" → "the"  (lowercase only, so names stay)
@@ -251,7 +269,14 @@ STOPWORDS = {"the", "and", "that", "this", "with", "for", "from", "your", "what"
              "which", "about", "into", "have", "will", "would", "should", "could", "there",
              "want", "like", "something", "because", "feeling", "come", "just", "please",
              "very", "really", "some", "also", "make", "sure", "thank", "thanks", "tell",
-             "either", "answer", "must", "help", "them", "they", "then", "than", "been"}
+             "either", "answer", "must", "help", "them", "they", "then", "than", "been", "between"}
+
+# words that are never the subject of a rule or request ("avoid USING jargon", "and WANTS protein")
+NOT_SUBJECTS = {"want", "wants", "wanted", "need", "needs", "like", "sound", "seem", "look", "feel",
+                "keep", "try", "eat", "use", "using", "make", "made", "does", "never", "avoid",
+                "without", "nahi", "dont", "don't", "doesn't", "mustn't", "shouldn't"}
+# Roman Urdu function words: they carry no meaning and are often dropped in a good rewrite
+ROMAN_URDU_FUNCTION = {"ek", "apne", "meri", "mera", "kyunke", "ke", "ko", "ka", "ki", "main", "hai", "do"}
 
 NEGATIONS = r"(do not|don't|dont|does not|doesn't|must not|mustn't|should not|shouldn't|never|no|not|avoid|without|nahi|mat|نہیں|نہ|مت)"
 # generic verbs after a negation; the real rule is in the noun that follows ("do not include EXAMPLES")
@@ -288,10 +313,26 @@ def _count_number(num, text):
     return len(re.findall(rf"(?<![\d.,]){re.escape(num)}(?![.,]?\d)", text))
 
 
+def _same_word(a, b):
+    """Same word ignoring endings: the first 4 letters match (sort/sorts, dict/dictionaries)."""
+    return a[:4] == b[:4]
+
+
+def _content_words(text, extra_skip=()):
+    """Words in a short window that can be the subject: no stopwords, negations, helper verbs.
+    Words ending in -ing are only used if there's nothing else ("avoid USING jargon" -> jargon)."""
+    words = [w for w in _words(text)
+             if len(w) > 3 and w not in STOPWORDS and w not in GENERIC_VERBS
+             and w not in NOT_SUBJECTS and w not in ROMAN_URDU_FUNCTION and w not in extra_skip
+             and not re.fullmatch(NEGATIONS, w)]
+    plain = [w for w in words if not w.endswith("ing")]
+    return plain or words
+
+
 def _negated(word, words, window=4):
     """True if some occurrence of `word` has a negation within the 4 words before it."""
     for i, w in enumerate(words):
-        if w.startswith(word[:5]):
+        if _same_word(w, word):
             if re.search(rf"\b{NEGATIONS}\b", " ".join(words[max(0, i - window):i])):
                 return True
     return False
@@ -321,9 +362,9 @@ def lost_constraints(before, after, check_subjects=True):
         return lost
     after_words = _words(after)
     for m in re.finditer(rf"\b{NEGATIONS}\b((?:\s+[\w']+){{1,4}})", before.lower()):
-        words = [w for w in _words(m.group(2))
-                 if len(w) > 3 and w not in STOPWORDS and w not in GENERIC_VERBS]
-        if words and not _negated(words[0], after_words):   # words[0] = what the rule is about
+        words = _content_words(m.group(2))
+        # kept if at least one subject word survives with a negation right before it
+        if words and not any(_negated(w, after_words) for w in words):
             lost.append(f"{m.group(1)}{m.group(2)}".strip())
     return lost
 
@@ -334,24 +375,26 @@ def lost_requests(before, after):
     lost = []
     after_words = _words(after)
     for m in re.finditer(r"\b(and|also|plus)\b((?:\s+[\w']+){1,4})", before.lower()):
-        words = [w for w in _words(m.group(2))          # skip verbs: "and explain why..." asks nothing new
-                 if len(w) > 3 and w not in STOPWORDS and w not in GENERIC_VERBS and w not in REQUEST_VERBS]
-        if words and not any(a.startswith(words[0][:5]) for a in after_words):
+        # skip verbs ("and explain why...") and negations ("and never modifies...")
+        words = _content_words(m.group(2), extra_skip=REQUEST_VERBS)
+        if words and not any(_same_word(a, w) for w in words for a in after_words):
             lost.append(words[0])
     return lost
 
 
 def keyword_overlap(original, rewritten):
     """Share of the original's key words still in the rewrite (0.0 to 1.0).
-    Words are compared by their first 5 letters, so 'lyrics' matches 'lyrical'.
+    Words are compared by their first 4 letters, so 'lyrics' matches 'lyrical' and 'dicts'
+    matches 'dictionaries'. Negations, helper verbs and Roman Urdu function words don't count.
     Works for any script; Chinese/Japanese/Korean are compared by character pairs."""
     def keys(t):
         if script_of(t) == "cjk":
             chars = [c for c in t if c.isalpha()]
             return {a + b for a, b in zip(chars, chars[1:])}
         min_len = 3 if script_of(t) in ("latin", "none") else 1
-        return {w[:5] for w in _words(t)
-                if len(w) > min_len and w not in STOPWORDS and w not in GENERIC_VERBS}
+        return {w[:4] for w in _words(t)
+                if len(w) > min_len and w not in STOPWORDS and w not in GENERIC_VERBS
+                and w not in NOT_SUBJECTS and w not in ROMAN_URDU_FUNCTION and not re.fullmatch(NEGATIONS, w)}
     orig = keys(original)
     if len(orig) < 4:
         return 1.0      # too few key words to judge (e.g. short, misspelled prompts)
@@ -363,8 +406,9 @@ COMMAND_WORDS = {"npm", "pip", "git", "cd", "ls", "sudo", "py", "node", "yarn", 
 def capitalize_first(text):
     """Capitalize the first letter, but not words like iPhone, npm, e.g., paths or URLs."""
     first = text.split(None, 1)[0] if text.strip() else ""
-    if (not first or any(c.isupper() for c in first[1:]) or re.search(r"[./\\:_\-@\d]", first)
-            or first.lower() in COMMAND_WORDS):
+    core = first.rstrip(".,!?;:")              # "explain." is a word, "e.g." and "x.com" are not
+    if (not core or any(c.isupper() for c in core[1:]) or re.search(r"[./\\:_\-@\d]", core)
+            or core.lower() in COMMAND_WORDS):
         return text
     return text[:1].upper() + text[1:]
 

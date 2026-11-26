@@ -184,9 +184,21 @@ def read_prompt(stream=None, interactive=None):
         interactive = stream.isatty()
     if interactive:
         print("Paste your prompt. When you're done, press Enter on two empty lines (or type END).")
+    def next_line():
+        # typing in the terminal: input() always hands over one line at a time
+        if interactive and stream is sys.stdin:
+            return input()                          # raises EOFError on Ctrl+Z / Ctrl+D
+        line = stream.readline()
+        if line == "":
+            raise EOFError
+        return line
+
     lines = []
-    for line in stream:
-        line = line.rstrip("\r\n")
+    while True:
+        try:
+            line = next_line().rstrip("\r\n")
+        except EOFError:
+            break
         if line.strip() == "END":
             break
         if interactive and line == "" and lines and lines[-1] == "":
